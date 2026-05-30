@@ -23,23 +23,37 @@ controlled by env vars (`TRITON_CPU_TAIL_GUARD`, `TRITON_CPU_PID_REGION`).
 
 ## Headline result
 
-3-way comparison at OMP=8 (interleaved 300 rounds, median):
+3-way comparison at `OMP_NUM_THREADS=8`, BLOCK 64×64×32, interleaved 300
+rounds, median time per kernel launch:
 
-| Workload                        | manual `if/else` | **4-variant quad** |
-|---------------------------------|------------------|--------------------|
-| 512×512×512  (aligned)          | 0.97× ↓          | **1.02×**          |
-| 1024×1024×1024 (aligned)        | 0.97× ↓          | **1.03×**          |
-| 1000×1000×1000 (tail)           | 0.96× ↓          | **1.02×**          |
-| 2048×2048×2048 (aligned)        | 1.05×            | **1.11×**          |
-| 2000×2000×2000 (tail)           | 1.02×            | **1.10×**          |
+| Workload                  | baseline (µs) | manual `if/else` (µs)     | **4-variant quad (µs)** |
+|---------------------------|---------------|---------------------------|-------------------------|
+| 300×300×300   (tail)      |    289        |    300  (0.97× ↓)         |   **283  (1.02×)**      |
+| 512×512×512   (aligned)   |   1 139       |  1 178  (0.97× ↓)         | **1 115  (1.02×)**      |
+| 500×500×500   (tail)      |   1 154       |  1 197  (0.96× ↓)         | **1 132  (1.02×)**      |
+| 1024×1024×1024 (aligned)  |   9 354       |  9 686  (0.97× ↓)         | **9 112  (1.03×)**      |
+| 1000×1000×1000 (tail)     |   9 169       |  9 547  (0.96× ↓)         | **9 000  (1.02×)**      |
+| 1000×800×900  (asymm.)    |   6 669       |  6 947  (0.96× ↓)         | **6 565  (1.02×)**      |
+| 2048×2048×2048 (aligned)  |  75 029       | 71 254  (1.05×)           | **67 489 (1.11×)**      |
+| 2000×2000×2000 (tail)     |  73 765       | 72 258  (1.02×)           | **67 366 (1.10×)**      |
 
-Baseline = always-masked kernel (the same kernel run on every tile).
+Three implementations measured:
 
-Quad **strictly dominates** the obvious manual `if/else` rewrite at every
-size — the manual rewrite *regresses* 3-4 % on small/mid sizes because
-both branches share a single kernel (I-cache pressure plus `scf.if`
-region barriers blocking cross-branch LLVM optimization).  Compile-time
-variant separation in quad dispatch avoids both costs.
+- **baseline** — the unmodified Triton kernel: every load/store pays the
+  `(offs_m < M) & (offs_k + k < K) & (offs_n < N)` mask cost on every tile.
+- **manual `if/else`** — the kernel itself runtime-branches on
+  `(pid_m + 1) * BLOCK_M <= M && (pid_n + 1) * BLOCK_N <= N`, picking a
+  no-M/N-mask path for full tiles and the masked path otherwise.  This is
+  the obvious thing a programmer would write by hand.
+- **4-variant quad** — this fork's automatic compile-time specialization:
+  four separately compiled kernels (`main` / `m_tail` / `n_tail` / `corner`)
+  dispatched per-tile by `launch_quad` in C.
+
+Quad **strictly dominates** the manual `if/else` rewrite at every size —
+the manual rewrite *regresses* 3-4 % on small/mid sizes because both
+branches share a single kernel (I-cache pressure plus `scf.if` region
+barriers blocking cross-branch LLVM optimization).  Compile-time variant
+separation avoids both costs.
 
 ## Full technical writeup
 
