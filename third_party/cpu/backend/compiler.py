@@ -53,6 +53,8 @@ class CPUOptions:
     # TODO: Try to enable it.
     sanitize_overflow: bool = False
     instrumentation_mode: str = ""
+    enable_tail_guard: bool = True
+    enable_pid_region_dispatch: bool = False
 
     # TODO: We may introduce CPU-specific options like # of cores.
     ukernels: str = None
@@ -133,6 +135,10 @@ class CPUBackend(BaseBackend):
         args = {k: opts[k] for k in CPUOptions.__dataclass_fields__.keys() if k in opts}
         if "enable_fast_math" not in args:
             args["enable_fast_math"] = os.getenv("TRITON_CPU_FAST_MATH", "1") != "0"
+        if "enable_tail_guard" not in args:
+            args["enable_tail_guard"] = os.getenv("TRITON_CPU_TAIL_GUARD", "1") != "0"
+        if "enable_pid_region_dispatch" not in args:
+            args["enable_pid_region_dispatch"] = os.getenv("TRITON_CPU_PID_REGION", "0") != "0"
         if "supported_fp8_dtypes" not in args:
             supported_fp8_dtypes = set(CPUOptions.supported_fp8_dtypes)
             args["supported_fp8_dtypes"] = tuple(sorted(supported_fp8_dtypes))

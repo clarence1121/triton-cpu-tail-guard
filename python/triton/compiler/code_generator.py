@@ -1653,7 +1653,8 @@ def ast_to_ttir(fn, src, context, options, codegen_fns, module_map, module=None)
                               jit_fn=fn, is_kernel=True, file_name=fn.file_name, begin_line=fn.def_file_line_number,
                               begin_col=fn.def_file_col_number, options=options, codegen_fns=codegen_fns,
                               module_map=module_map, module=module, is_gluon=fn.is_gluon())
-    generator.visit(fn.parse())
+    parse = getattr(src, "parse", fn.parse)
+    generator.visit(parse())
     module = generator.module
     # module takes ownership of the context
     module.context = context

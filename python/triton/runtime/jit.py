@@ -4,6 +4,7 @@ import copy
 import hashlib
 import inspect
 import itertools
+import os
 import threading
 import re
 import textwrap
@@ -693,10 +694,14 @@ class JITFunction(JITCallable, KernelInterface[T]):
         """
         Precompute as much as possible.
         """
-        from ..compiler import CompiledKernel, compile, ASTSource, make_backend
+        from ..compiler import (CompiledKernel, DualPathCompiledKernel, QuadPathCompiledKernel,
+                                RegionCompiledKernel, compile, ASTSource, make_backend)
         target = driver.active.get_current_target()
         backend = make_backend(target)
         self.CompiledKernel = CompiledKernel
+        self.DualPathCompiledKernel = DualPathCompiledKernel
+        self.QuadPathCompiledKernel = QuadPathCompiledKernel
+        self.RegionCompiledKernel = RegionCompiledKernel
         self.compile = compile
         self.ASTSource = ASTSource
         binder = create_function_from_signature(self.signature, self.params, backend)
@@ -743,6 +748,12 @@ class JITFunction(JITCallable, KernelInterface[T]):
         # specialization is list[tuple[str, Any]], where first element of tuple is
         # the type and the second parameter is the 'specialization' value.
         bound_args, specialization, options = binder(*args, **kwargs)
+        if target.backend == "cpu" and "enable_tail_guard" not in options:
+            options = dict(options)
+            options["enable_tail_guard"] = os.getenv("TRITON_CPU_TAIL_GUARD", "1") != "0"
+        if target.backend == "cpu" and "enable_pid_region_dispatch" not in options:
+            options = dict(options)
+            options["enable_pid_region_dispatch"] = os.getenv("TRITON_CPU_PID_REGION", "0") != "0"
 
         # add a cache field to the kernel specializations for kernel specific
         # pass pipelines
@@ -885,6 +896,41 @@ class JITFunction(JITCallable, KernelInterface[T]):
                            warmup):
             return None
         src = self.ASTSource(self, signature, constexprs, attrs)
+        dual_tail_analysis = None
+        quad_tail_analysis = None
+        if target.backend == "cpu" and getattr(options, "enable_tail_guard", False):
+            from triton.compiler.cpu_tail import analyze_cpu_tail, analyze_cpu_tail_2d
+            quad_tail_analysis = analyze_cpu_tail_2d(self, src)
+            if quad_tail_analysis.diagnostic.matched:
+                dual_tail_analysis = None  # 2D takes priority
+            else:
+                quad_tail_analysis = None
+                dual_tail_analysis = analyze_cpu_tail(self, src)
+                if not dual_tail_analysis.diagnostic.matched:
+                    dual_tail_analysis = None
+
+        # Check for region plan: decorator-attached plan takes priority,
+        # then auto-detection (only when enable_pid_region_dispatch=True).
+        # Region dispatch is mutually exclusive with tail_guard.
+        region_plan = None
+        if dual_tail_analysis is None and target.backend == "cpu":
+            region_plan = getattr(self, '_cpu_region_plan', None)
+            if region_plan is None and getattr(options, "enable_pid_region_dispatch", False):
+                from triton.compiler.cpu_pid_region import analyze_pid_region
+                analysis = analyze_pid_region(self, src)
+                if analysis.diagnostic.matched:
+                    region_plan = analysis.to_region_plan()
+
+        def _build_region_kernel(compile_fn):
+            kernels_and_launchers = []
+            for spec in region_plan.active_regions:
+                spec_src = self.ASTSource(self, signature, constexprs, attrs,
+                                         cpu_region_spec=spec,
+                                         cpu_region_pid_vars=region_plan.pid_vars,
+                                         cpu_region_all_specs=region_plan.regions)
+                k = compile_fn(spec_src)
+                kernels_and_launchers.append((k, spec.launcher))
+            return self.RegionCompiledKernel(kernels_and_launchers)
 
         async_mode = _async_compile.active_mode.get()
         if async_mode is not None:
@@ -893,6 +939,23 @@ class JITFunction(JITCallable, KernelInterface[T]):
             cache_key = get_cache_key(src, backend, options, env_vars)
 
             def async_compile():
+                if quad_tail_analysis is not None:
+                    def _mk(v):
+                        return self.compile(
+                            self.ASTSource(self, signature, constexprs, attrs, cpu_tail_2d_variant=v),
+                            target=target, options=options.__dict__, _env_vars=env_vars)
+                    return self.QuadPathCompiledKernel(
+                        _mk("main"), _mk("m_tail"), _mk("n_tail"),
+                        self.compile(src, target=target, options=options.__dict__, _env_vars=env_vars),
+                        quad_tail_analysis.diagnostic)
+                if dual_tail_analysis is not None:
+                    tail_kernel = self.compile(src, target=target, options=options.__dict__, _env_vars=env_vars)
+                    main_src = self.ASTSource(self, signature, constexprs, attrs, cpu_tail_variant="main")
+                    main_kernel = self.compile(main_src, target=target, options=options.__dict__, _env_vars=env_vars)
+                    return self.DualPathCompiledKernel(main_kernel, tail_kernel, dual_tail_analysis.diagnostic)
+                if region_plan is not None:
+                    return _build_region_kernel(
+                        lambda s: self.compile(s, target=target, options=options.__dict__, _env_vars=env_vars))
                 return self.compile(src, target=target, options=options.__dict__, _env_vars=env_vars)
 
             def finalize_compile(kernel):
@@ -903,7 +966,25 @@ class JITFunction(JITCallable, KernelInterface[T]):
             kernel = async_mode.submit(cache_key, async_compile, finalize_compile)
             kernel_cache[key] = kernel
         else:
-            kernel = self.compile(src, target=target, options=options.__dict__)
+            if quad_tail_analysis is not None:
+                def _mk2d(v):
+                    return self.compile(
+                        self.ASTSource(self, signature, constexprs, attrs, cpu_tail_2d_variant=v),
+                        target=target, options=options.__dict__)
+                corner_kernel = self.compile(src, target=target, options=options.__dict__)
+                kernel = self.QuadPathCompiledKernel(
+                    _mk2d("main"), _mk2d("m_tail"), _mk2d("n_tail"),
+                    corner_kernel, quad_tail_analysis.diagnostic)
+            elif dual_tail_analysis is not None:
+                tail_kernel = self.compile(src, target=target, options=options.__dict__)
+                main_src = self.ASTSource(self, signature, constexprs, attrs, cpu_tail_variant="main")
+                main_kernel = self.compile(main_src, target=target, options=options.__dict__)
+                kernel = self.DualPathCompiledKernel(main_kernel, tail_kernel, dual_tail_analysis.diagnostic)
+            elif region_plan is not None:
+                kernel = _build_region_kernel(
+                    lambda s: self.compile(s, target=target, options=options.__dict__))
+            else:
+                kernel = self.compile(src, target=target, options=options.__dict__)
             kernel_cache[key] = kernel
             self._call_hook(knobs.runtime.jit_post_compile_hook, key, signature, target, device, constexprs, options,
                             [attrs], warmup)
