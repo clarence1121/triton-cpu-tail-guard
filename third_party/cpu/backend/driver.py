@@ -159,6 +159,7 @@ def make_launcher(constants, signature, ids):
 
     args_format = ''.join([format_of(ty) for ty in signature.values()])
     format = "iiiOKOOOO" + args_format
+    offset_format = "iiiiOKOOOO" + args_format
 
     signature = ','.join(map(_serialize_signature, signature.values()))
     signature = list(filter(bool, signature.split(',')))
@@ -253,13 +254,13 @@ static inline DevicePtrInfo getPointer(PyObject *obj, int idx) {{
   return ptr_info;
 }}
 
-static std::unique_ptr<uint32_t[][3]> get_all_grids(uint32_t gridX, uint32_t gridY, uint32_t gridZ) {{
+static std::unique_ptr<uint32_t[][3]> get_all_grids(uint32_t startX, uint32_t gridX, uint32_t gridY, uint32_t gridZ) {{
   std::unique_ptr<uint32_t[][3]> grids(new uint32_t[gridX * gridY * gridZ][3]);
   // TODO: which order would be more effective for cache locality?
   for (uint32_t z = 0; z < gridZ; ++z) {{
     for (uint32_t y = 0; y < gridY; ++y) {{
       for (uint32_t x = 0; x < gridX; ++x) {{
-        grids[z * gridY * gridX + y * gridX + x][0] = x;
+        grids[z * gridY * gridX + y * gridX + x][0] = startX + x;
         grids[z * gridY * gridX + y * gridX + x][1] = y;
         grids[z * gridY * gridX + y * gridX + x][2] = z;
       }}
@@ -268,15 +269,15 @@ static std::unique_ptr<uint32_t[][3]> get_all_grids(uint32_t gridX, uint32_t gri
   return grids;
 }}
 
-static void run_omp_kernels(uint32_t gridX, uint32_t gridY, uint32_t gridZ, int num_threads, kernel_ptr_t kernel_ptr {(', ' + arg_decls) if len(arg_decls) > 0 else ''}) {{
+static void run_omp_kernels(uint32_t startX, uint32_t gridX, uint32_t gridY, uint32_t gridZ, int num_threads, kernel_ptr_t kernel_ptr {(', ' + arg_decls) if len(arg_decls) > 0 else ''}) {{
   // TODO: Consider using omp collapse(3) clause for simplicity?
   size_t N = gridX * gridY * gridZ;
   if (N == 1) {{
-      (*kernel_ptr)({kernel_fn_args_list + ', ' if len(kernel_fn_args) > 0 else ''} 0, 0, 0, 1, 1, 1);
+      (*kernel_ptr)({kernel_fn_args_list + ', ' if len(kernel_fn_args) > 0 else ''} startX, 0, 0, gridX, gridY, gridZ);
       return;
   }}
 
-  auto all_grids = get_all_grids(gridX, gridY, gridZ);
+  auto all_grids = get_all_grids(startX, gridX, gridY, gridZ);
   int omp_max_threads = 1;
   #ifdef _OPENMP
   omp_max_threads = omp_get_max_threads();
@@ -299,6 +300,163 @@ static void run_omp_kernels(uint32_t gridX, uint32_t gridY, uint32_t gridZ, int 
   for (size_t i = 0; i < N; ++i) {{
     const auto [x, y, z] = all_grids[i];
     (*kernel_ptr)({kernel_fn_args_list + ', ' if len(kernel_fn_args) > 0 else ''} x, y, z, gridX, gridY, gridZ);
+  }}
+}}
+
+static inline void lower_tri_unrank(uint64_t idx, uint32_t &pidX, uint32_t &pidY) {{
+  // Enumerates row-major lower-triangle tasks: for x in [1, T), y in [0, x).
+  uint64_t x = static_cast<uint64_t>((1.0 + std::sqrt(1.0 + 8.0 * static_cast<double>(idx))) / 2.0);
+  uint64_t base = x * (x - 1) / 2;
+  while (base > idx) {{
+    --x;
+    base = x * (x - 1) / 2;
+  }}
+  while ((x + 1) * x / 2 <= idx) {{
+    ++x;
+    base = x * (x - 1) / 2;
+  }}
+  pidX = static_cast<uint32_t>(x);
+  pidY = static_cast<uint32_t>(idx - base);
+}}
+
+static void run_omp_lower_tri_2d(uint32_t gridX, uint32_t gridY, uint32_t gridZ, int num_threads, kernel_ptr_t kernel_ptr {(', ' + arg_decls) if len(arg_decls) > 0 else ''}) {{
+  if (gridX != gridY || gridX == 0)
+    return;
+  uint64_t row_tasks = static_cast<uint64_t>(gridX - 1) * gridZ;
+  if (row_tasks == 0)
+    return;
+
+  int omp_max_threads = 1;
+  #ifdef _OPENMP
+  omp_max_threads = omp_get_max_threads();
+  #endif // _OPENMP
+  int max_threads = (num_threads > 0) ? num_threads : omp_max_threads;
+
+  if (max_threads == 1) {{
+    for (uint64_t task = 0; task < row_tasks; ++task) {{
+      uint32_t z = static_cast<uint32_t>(task / (gridX - 1));
+      uint32_t x = static_cast<uint32_t>(task - static_cast<uint64_t>(z) * (gridX - 1)) + 1;
+      for (uint32_t y = 0; y < x; ++y) {{
+        (*kernel_ptr)({kernel_fn_args_list + ', ' if len(kernel_fn_args) > 0 else ''} x, y, z, gridX, gridY, gridZ);
+      }}
+    }}
+    return;
+  }}
+
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic, 1) num_threads(max_threads)
+#endif // _OPENMP
+  for (uint64_t task = 0; task < row_tasks; ++task) {{
+    uint32_t z = static_cast<uint32_t>(task / (gridX - 1));
+    uint32_t x = static_cast<uint32_t>(task - static_cast<uint64_t>(z) * (gridX - 1)) + 1;
+    for (uint32_t y = 0; y < x; ++y) {{
+      (*kernel_ptr)({kernel_fn_args_list + ', ' if len(kernel_fn_args) > 0 else ''} x, y, z, gridX, gridY, gridZ);
+    }}
+  }}
+}}
+
+static void run_omp_diagonal_2d(uint32_t gridX, uint32_t gridY, uint32_t gridZ, int num_threads, kernel_ptr_t kernel_ptr {(', ' + arg_decls) if len(arg_decls) > 0 else ''}) {{
+  uint32_t diag = std::min(gridX, gridY);
+  uint64_t num_tasks = static_cast<uint64_t>(diag) * gridZ;
+  if (num_tasks == 0)
+    return;
+
+  int omp_max_threads = 1;
+  #ifdef _OPENMP
+  omp_max_threads = omp_get_max_threads();
+  #endif // _OPENMP
+  int max_threads = (num_threads > 0) ? num_threads : omp_max_threads;
+
+  if (max_threads == 1) {{
+    for (uint64_t task = 0; task < num_tasks; ++task) {{
+      uint32_t z = static_cast<uint32_t>(task / diag);
+      uint32_t x = static_cast<uint32_t>(task - static_cast<uint64_t>(z) * diag);
+      (*kernel_ptr)({kernel_fn_args_list + ', ' if len(kernel_fn_args) > 0 else ''} x, x, z, gridX, gridY, gridZ);
+    }}
+    return;
+  }}
+
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(max_threads)
+#endif // _OPENMP
+  for (uint64_t task = 0; task < num_tasks; ++task) {{
+    uint32_t z = static_cast<uint32_t>(task / diag);
+    uint32_t x = static_cast<uint32_t>(task - static_cast<uint64_t>(z) * diag);
+    (*kernel_ptr)({kernel_fn_args_list + ', ' if len(kernel_fn_args) > 0 else ''} x, x, z, gridX, gridY, gridZ);
+  }}
+}}
+
+// Op codes for run_omp_region_2d: comparison pidY OP pidX
+//   0=LT(y<x)  1=LE(y<=x)  2=EQ(y==x)  3=GE(y>=x)  4=GT(y>x)  5=NE(y!=x)
+static void run_omp_region_2d(int op, uint32_t gridX, uint32_t gridY, uint32_t gridZ,
+                              int num_threads, kernel_ptr_t kernel_ptr {(', ' + arg_decls) if len(arg_decls) > 0 else ''}) {{
+  // Fast path: delegate to the optimised specialised runners for the two
+  // most common cases (lower triangle and diagonal).
+  if (op == 0) {{
+    run_omp_lower_tri_2d(gridX, gridY, gridZ, num_threads, kernel_ptr {(', ' + ', '.join(f"arg{i}" for i in kernel_fn_args)) if len(kernel_fn_args) > 0 else ''});
+    return;
+  }}
+  if (op == 2) {{
+    run_omp_diagonal_2d(gridX, gridY, gridZ, num_threads, kernel_ptr {(', ' + ', '.join(f"arg{i}" for i in kernel_fn_args)) if len(kernel_fn_args) > 0 else ''});
+    return;
+  }}
+
+  // Generic path: outer loop over (x, z) pairs, inner loop over y with condition.
+  uint64_t outer_tasks = static_cast<uint64_t>(gridX) * gridZ;
+  if (outer_tasks == 0) return;
+
+  int omp_max_threads = 1;
+  #ifdef _OPENMP
+  omp_max_threads = omp_get_max_threads();
+  #endif // _OPENMP
+  int max_threads = (num_threads > 0) ? num_threads : omp_max_threads;
+
+  if (max_threads == 1) {{
+    for (uint64_t task = 0; task < outer_tasks; ++task) {{
+      uint32_t z = static_cast<uint32_t>(task / gridX);
+      uint32_t x = static_cast<uint32_t>(task - static_cast<uint64_t>(z) * gridX);
+      if (op == 5) {{ // NE: [0, x) ∪ [x+1, gridY)
+        for (uint32_t y = 0; y < x && y < gridY; ++y)
+          (*kernel_ptr)({kernel_fn_args_list + ', ' if len(kernel_fn_args) > 0 else ''} x, y, z, gridX, gridY, gridZ);
+        for (uint32_t y = x + 1; y < gridY; ++y)
+          (*kernel_ptr)({kernel_fn_args_list + ', ' if len(kernel_fn_args) > 0 else ''} x, y, z, gridX, gridY, gridZ);
+      }} else {{
+        uint32_t y_lo, y_hi;
+        switch (op) {{
+        case 1: y_lo = 0;     y_hi = x + 1; break; // LE: [0, x]
+        case 3: y_lo = x;     y_hi = gridY; break;  // GE: [x, gridY)
+        case 4: y_lo = x + 1; y_hi = gridY; break;  // GT: [x+1, gridY)
+        default: y_lo = 0; y_hi = 0; break;
+        }}
+        for (uint32_t y = y_lo; y < y_hi; ++y)
+          (*kernel_ptr)({kernel_fn_args_list + ', ' if len(kernel_fn_args) > 0 else ''} x, y, z, gridX, gridY, gridZ);
+      }}
+    }}
+    return;
+  }}
+
+  #ifdef _OPENMP
+  #pragma omp parallel for schedule(dynamic, 1) num_threads(max_threads)
+  #endif // _OPENMP
+  for (uint64_t task = 0; task < outer_tasks; ++task) {{
+    uint32_t z = static_cast<uint32_t>(task / gridX);
+    uint32_t x = static_cast<uint32_t>(task - static_cast<uint64_t>(z) * gridX);
+    if (op == 5) {{
+      for (uint32_t y = 0; y < x && y < gridY; ++y)
+        (*kernel_ptr)({kernel_fn_args_list + ', ' if len(kernel_fn_args) > 0 else ''} x, y, z, gridX, gridY, gridZ);
+      for (uint32_t y = x + 1; y < gridY; ++y)
+        (*kernel_ptr)({kernel_fn_args_list + ', ' if len(kernel_fn_args) > 0 else ''} x, y, z, gridX, gridY, gridZ);
+    }} else {{
+      uint32_t y_lo, y_hi;
+      switch (op) {{
+      case 1: y_lo = 0;     y_hi = x + 1; break;
+      case 3: y_lo = x;     y_hi = gridY; break;
+      case 4: y_lo = x + 1; y_hi = gridY; break;
+      default: y_lo = 0; y_hi = 0; break;
+      }}
+      for (uint32_t y = y_lo; y < y_hi; ++y)
+        (*kernel_ptr)({kernel_fn_args_list + ', ' if len(kernel_fn_args) > 0 else ''} x, y, z, gridX, gridY, gridZ);
+    }}
   }}
 }}
 
@@ -337,7 +495,7 @@ static PyObject* launch(PyObject* self, PyObject* args) {{
   }}
 
   {"; ".join([f"DevicePtrInfo ptr_info{i} = getPointer(arg{i}, {i}); if (!ptr_info{i}.valid) return NULL;" if ty[0] == "*" else "" for i, ty in signature_without_constexprs.items()])};
-  run_omp_kernels(gridX, gridY, gridZ, num_threads, kernel_ptr {(', ' + ', '.join(f"ptr_info{i}.dev_ptr" if ty[0]=="*" else f"arg{i}" for i, ty in signature_without_constexprs.items())) if len(signature_without_constexprs) > 0 else ''});
+  run_omp_kernels(0, gridX, gridY, gridZ, num_threads, kernel_ptr {(', ' + ', '.join(f"ptr_info{i}.dev_ptr" if ty[0]=="*" else f"arg{i}" for i, ty in signature_without_constexprs.items())) if len(signature_without_constexprs) > 0 else ''});
 
   if(launch_exit_hook != Py_None){{
     PyObject* args = Py_BuildValue("(O)", launch_metadata);
@@ -356,8 +514,450 @@ static PyObject* launch(PyObject* self, PyObject* args) {{
   return Py_None;
 }}
 
+static PyObject* launch_offset(PyObject* self, PyObject* args) {{
+  int startX, gridX, gridY, gridZ;
+  PyObject *launch_enter_hook = NULL;
+  PyObject *launch_exit_hook = NULL;
+  PyObject *kernel_metadata = NULL;
+  PyObject *launch_metadata = NULL;
+  PyObject *py_obj_stream;
+  void* pKrnl;
+
+  {' '.join([f"{_extracted_type(ty)} arg{i}; " for i, ty in signature.items()])}
+  if(!PyArg_ParseTuple(args, \"{offset_format}\", &startX, &gridX, &gridY, &gridZ, &py_obj_stream, &pKrnl,
+                                       &kernel_metadata, &launch_metadata,
+                                       &launch_enter_hook, &launch_exit_hook {', ' + arg_ptrs_list if len(signature) > 0 else ''})) {{
+    return NULL;
+  }}
+
+  void *pStream = PyLong_AsVoidPtr(py_obj_stream);
+  kernel_ptr_t kernel_ptr = reinterpret_cast<kernel_ptr_t>(pKrnl);
+
+  int num_threads = 0;
+  PyObject *num_threads_attr = PyObject_GetAttrString(kernel_metadata, "num_cpu_threads");
+  if (num_threads_attr && PyLong_Check(num_threads_attr))
+    num_threads = PyLong_AsLong(num_threads_attr);
+
+  if (launch_enter_hook != Py_None){{
+    PyObject* args = Py_BuildValue("(O)", launch_metadata);
+    PyObject* ret = PyObject_CallObject(launch_enter_hook, args);
+    Py_DECREF(args);
+    if (!ret)
+      return NULL;
+  }}
+
+  {"; ".join([f"DevicePtrInfo ptr_info{i} = getPointer(arg{i}, {i}); if (!ptr_info{i}.valid) return NULL;" if ty[0] == "*" else "" for i, ty in signature_without_constexprs.items()])};
+  run_omp_kernels(startX, gridX, gridY, gridZ, num_threads, kernel_ptr {(', ' + ', '.join(f"ptr_info{i}.dev_ptr" if ty[0]=="*" else f"arg{i}" for i, ty in signature_without_constexprs.items())) if len(signature_without_constexprs) > 0 else ''});
+
+  if(launch_exit_hook != Py_None){{
+    PyObject* args = Py_BuildValue("(O)", launch_metadata);
+    PyObject* ret = PyObject_CallObject(launch_exit_hook, args);
+    Py_DECREF(args);
+    if (!ret)
+      return NULL;
+  }}
+
+  if (PyErr_Occurred()) {{
+    return NULL;
+  }}
+
+  Py_INCREF(Py_None);
+  return Py_None;
+}}
+
+static PyObject* launch_lower_tri_2d(PyObject* self, PyObject* args) {{
+  int gridX, gridY, gridZ;
+  PyObject *launch_enter_hook = NULL;
+  PyObject *launch_exit_hook = NULL;
+  PyObject *kernel_metadata = NULL;
+  PyObject *launch_metadata = NULL;
+  PyObject *py_obj_stream;
+  void* pKrnl;
+
+  {' '.join([f"{_extracted_type(ty)} arg{i}; " for i, ty in signature.items()])}
+  if(!PyArg_ParseTuple(args, \"{format}\", &gridX, &gridY, &gridZ, &py_obj_stream, &pKrnl,
+                                       &kernel_metadata, &launch_metadata,
+                                       &launch_enter_hook, &launch_exit_hook {', ' + arg_ptrs_list if len(signature) > 0 else ''})) {{
+    return NULL;
+  }}
+
+  void *pStream = PyLong_AsVoidPtr(py_obj_stream);
+  kernel_ptr_t kernel_ptr = reinterpret_cast<kernel_ptr_t>(pKrnl);
+
+  int num_threads = 0;
+  PyObject *num_threads_attr = PyObject_GetAttrString(kernel_metadata, "num_cpu_threads");
+  if (num_threads_attr && PyLong_Check(num_threads_attr))
+    num_threads = PyLong_AsLong(num_threads_attr);
+
+  if (launch_enter_hook != Py_None){{
+    PyObject* args = Py_BuildValue("(O)", launch_metadata);
+    PyObject* ret = PyObject_CallObject(launch_enter_hook, args);
+    Py_DECREF(args);
+    if (!ret)
+      return NULL;
+  }}
+
+  {"; ".join([f"DevicePtrInfo ptr_info{i} = getPointer(arg{i}, {i}); if (!ptr_info{i}.valid) return NULL;" if ty[0] == "*" else "" for i, ty in signature_without_constexprs.items()])};
+  run_omp_lower_tri_2d(gridX, gridY, gridZ, num_threads, kernel_ptr {(', ' + ', '.join(f"ptr_info{i}.dev_ptr" if ty[0]=="*" else f"arg{i}" for i, ty in signature_without_constexprs.items())) if len(signature_without_constexprs) > 0 else ''});
+
+  if(launch_exit_hook != Py_None){{
+    PyObject* args = Py_BuildValue("(O)", launch_metadata);
+    PyObject* ret = PyObject_CallObject(launch_exit_hook, args);
+    Py_DECREF(args);
+    if (!ret)
+      return NULL;
+  }}
+
+  if (PyErr_Occurred()) {{
+    return NULL;
+  }}
+
+  Py_INCREF(Py_None);
+  return Py_None;
+}}
+
+static PyObject* launch_diagonal_2d(PyObject* self, PyObject* args) {{
+  int gridX, gridY, gridZ;
+  PyObject *launch_enter_hook = NULL;
+  PyObject *launch_exit_hook = NULL;
+  PyObject *kernel_metadata = NULL;
+  PyObject *launch_metadata = NULL;
+  PyObject *py_obj_stream;
+  void* pKrnl;
+
+  {' '.join([f"{_extracted_type(ty)} arg{i}; " for i, ty in signature.items()])}
+  if(!PyArg_ParseTuple(args, \"{format}\", &gridX, &gridY, &gridZ, &py_obj_stream, &pKrnl,
+                                       &kernel_metadata, &launch_metadata,
+                                       &launch_enter_hook, &launch_exit_hook {', ' + arg_ptrs_list if len(signature) > 0 else ''})) {{
+    return NULL;
+  }}
+
+  void *pStream = PyLong_AsVoidPtr(py_obj_stream);
+  kernel_ptr_t kernel_ptr = reinterpret_cast<kernel_ptr_t>(pKrnl);
+
+  int num_threads = 0;
+  PyObject *num_threads_attr = PyObject_GetAttrString(kernel_metadata, "num_cpu_threads");
+  if (num_threads_attr && PyLong_Check(num_threads_attr))
+    num_threads = PyLong_AsLong(num_threads_attr);
+
+  if (launch_enter_hook != Py_None){{
+    PyObject* args = Py_BuildValue("(O)", launch_metadata);
+    PyObject* ret = PyObject_CallObject(launch_enter_hook, args);
+    Py_DECREF(args);
+    if (!ret)
+      return NULL;
+  }}
+
+  {"; ".join([f"DevicePtrInfo ptr_info{i} = getPointer(arg{i}, {i}); if (!ptr_info{i}.valid) return NULL;" if ty[0] == "*" else "" for i, ty in signature_without_constexprs.items()])};
+  run_omp_diagonal_2d(gridX, gridY, gridZ, num_threads, kernel_ptr {(', ' + ', '.join(f"ptr_info{i}.dev_ptr" if ty[0]=="*" else f"arg{i}" for i, ty in signature_without_constexprs.items())) if len(signature_without_constexprs) > 0 else ''});
+
+  if(launch_exit_hook != Py_None){{
+    PyObject* args = Py_BuildValue("(O)", launch_metadata);
+    PyObject* ret = PyObject_CallObject(launch_exit_hook, args);
+    Py_DECREF(args);
+    if (!ret)
+      return NULL;
+  }}
+
+  if (PyErr_Occurred()) {{
+    return NULL;
+  }}
+
+  Py_INCREF(Py_None);
+  return Py_None;
+}}
+
+static PyObject* launch_region_2d(PyObject* self, PyObject* args) {{
+  int op, gridX, gridY, gridZ;
+  PyObject *launch_enter_hook = NULL;
+  PyObject *launch_exit_hook = NULL;
+  PyObject *kernel_metadata = NULL;
+  PyObject *launch_metadata = NULL;
+  PyObject *py_obj_stream;
+  void* pKrnl;
+
+  {' '.join([f"{_extracted_type(ty)} arg{i}; " for i, ty in signature.items()])}
+  if(!PyArg_ParseTuple(args, \"{offset_format}\", &op, &gridX, &gridY, &gridZ, &py_obj_stream, &pKrnl,
+                                       &kernel_metadata, &launch_metadata,
+                                       &launch_enter_hook, &launch_exit_hook {', ' + arg_ptrs_list if len(signature) > 0 else ''})) {{
+    return NULL;
+  }}
+
+  void *pStream = PyLong_AsVoidPtr(py_obj_stream);
+  kernel_ptr_t kernel_ptr = reinterpret_cast<kernel_ptr_t>(pKrnl);
+
+  int num_threads = 0;
+  PyObject *num_threads_attr = PyObject_GetAttrString(kernel_metadata, "num_cpu_threads");
+  if (num_threads_attr && PyLong_Check(num_threads_attr))
+    num_threads = PyLong_AsLong(num_threads_attr);
+
+  if (launch_enter_hook != Py_None){{
+    PyObject* args = Py_BuildValue("(O)", launch_metadata);
+    PyObject* ret = PyObject_CallObject(launch_enter_hook, args);
+    Py_DECREF(args);
+    if (!ret)
+      return NULL;
+  }}
+
+  {"; ".join([f"DevicePtrInfo ptr_info{i} = getPointer(arg{i}, {i}); if (!ptr_info{i}.valid) return NULL;" if ty[0] == "*" else "" for i, ty in signature_without_constexprs.items()])};
+  run_omp_region_2d(op, gridX, gridY, gridZ, num_threads, kernel_ptr {(', ' + ', '.join(f"ptr_info{i}.dev_ptr" if ty[0]=="*" else f"arg{i}" for i, ty in signature_without_constexprs.items())) if len(signature_without_constexprs) > 0 else ''});
+
+  if(launch_exit_hook != Py_None){{
+    PyObject* args = Py_BuildValue("(O)", launch_metadata);
+    PyObject* ret = PyObject_CallObject(launch_exit_hook, args);
+    Py_DECREF(args);
+    if (!ret)
+      return NULL;
+  }}
+
+  if (PyErr_Occurred()) {{
+    return NULL;
+  }}
+
+  Py_INCREF(Py_None);
+  return Py_None;
+}}
+
+static PyObject* launch_dual(PyObject* self, PyObject* args) {{
+  int gridX, gridY, gridZ;
+  int n_arg_idx, block_arg_idx;
+  PyObject *launch_enter_hook = NULL;
+  PyObject *launch_exit_hook = NULL;
+  PyObject *main_kernel_metadata = NULL;
+  PyObject *tail_kernel_metadata = NULL;
+  PyObject *launch_metadata = NULL;
+  PyObject *py_obj_stream;
+  void* pMainKrnl;
+  void* pTailKrnl;
+
+  {' '.join([f"{_extracted_type(ty)} arg{i}; " for i, ty in signature.items()])}
+  if(!PyArg_ParseTuple(args, \"iiiOKOKOOOOii{args_format}\", &gridX, &gridY, &gridZ,
+                                       &py_obj_stream, &pMainKrnl, &main_kernel_metadata,
+                                       &pTailKrnl, &tail_kernel_metadata, &launch_metadata,
+                                       &launch_enter_hook, &launch_exit_hook,
+                                       &n_arg_idx, &block_arg_idx {', ' + arg_ptrs_list if len(signature) > 0 else ''})) {{
+    return NULL;
+  }}
+
+  void *pStream = PyLong_AsVoidPtr(py_obj_stream);
+  kernel_ptr_t main_kernel_ptr = reinterpret_cast<kernel_ptr_t>(pMainKrnl);
+  kernel_ptr_t tail_kernel_ptr = reinterpret_cast<kernel_ptr_t>(pTailKrnl);
+
+  int num_threads = 0;
+  PyObject *num_threads_attr = PyObject_GetAttrString(tail_kernel_metadata, "num_cpu_threads");
+  if (num_threads_attr && PyLong_Check(num_threads_attr))
+    num_threads = PyLong_AsLong(num_threads_attr);
+
+  if (launch_enter_hook != Py_None){{
+    PyObject* args = Py_BuildValue("(O)", launch_metadata);
+    PyObject* ret = PyObject_CallObject(launch_enter_hook, args);
+    Py_DECREF(args);
+    if (!ret)
+      return NULL;
+  }}
+
+  {"; ".join([f"DevicePtrInfo ptr_info{i} = getPointer(arg{i}, {i}); if (!ptr_info{i}.valid) return NULL;" if ty[0] == "*" else "" for i, ty in signature_without_constexprs.items()])};
+
+  auto get_int_arg = [&](int idx, int64_t &out) -> bool {{
+    switch (idx) {{
+{''.join([f'''    case {i}: {{
+      {'if (!PyLong_Check(arg' + str(i) + ')) return false; out = PyLong_AsLongLong(arg' + str(i) + '); if (PyErr_Occurred()) { PyErr_Clear(); return false; } return true;' if ty == "constexpr" else ('return false;' if ty[0] == '*' or ty in ("fp16", "bf16", "fp32", "f32", "fp64") else 'out = static_cast<int64_t>(arg' + str(i) + '); return true;')}
+    }}
+''' for i, ty in signature.items()])}    default:
+      return false;
+    }}
+  }};
+
+  bool use_dual = false;
+  int64_t n_val = 0;
+  int64_t block_val = 0;
+  uint32_t full_tiles = 0;
+  bool has_tail = false;
+  if (gridY == 1 && gridZ == 1 &&
+      get_int_arg(n_arg_idx, n_val) && get_int_arg(block_arg_idx, block_val) &&
+      block_val > 0 && n_val >= 0) {{
+    int64_t expected_grid = (n_val + block_val - 1) / block_val;
+    if (gridX == expected_grid) {{
+      full_tiles = static_cast<uint32_t>(n_val / block_val);
+      has_tail = n_val != static_cast<int64_t>(full_tiles) * block_val;
+      use_dual = true;
+    }}
+  }}
+
+  if (use_dual) {{
+    uint32_t total = static_cast<uint32_t>(gridX);
+    int omp_max_threads_dual = 1;
+    #ifdef _OPENMP
+    omp_max_threads_dual = omp_get_max_threads();
+    #endif
+    int max_threads_dual = (num_threads > 0) ? num_threads : omp_max_threads_dual;
+    if (max_threads_dual == 1) {{
+      for (uint32_t i = 0; i < total; ++i) {{
+        kernel_ptr_t kptr = (i < full_tiles) ? main_kernel_ptr : tail_kernel_ptr;
+        (*kptr)({(', '.join(f"ptr_info{i}.dev_ptr" if ty[0]=='*' else f"arg{i}" for i, ty in signature_without_constexprs.items()) + ', ') if len(signature_without_constexprs) > 0 else ''}i, 0, 0, total, 1, 1);
+      }}
+    }} else {{
+      #ifdef _OPENMP
+      #pragma omp parallel for schedule(static) num_threads(max_threads_dual)
+      #endif
+      for (uint32_t i = 0; i < total; ++i) {{
+        kernel_ptr_t kptr = (i < full_tiles) ? main_kernel_ptr : tail_kernel_ptr;
+        (*kptr)({(', '.join(f"ptr_info{i}.dev_ptr" if ty[0]=='*' else f"arg{i}" for i, ty in signature_without_constexprs.items()) + ', ') if len(signature_without_constexprs) > 0 else ''}i, 0, 0, total, 1, 1);
+      }}
+    }}
+  }} else {{
+    run_omp_kernels(0, gridX, gridY, gridZ, num_threads, tail_kernel_ptr {(', ' + ', '.join(f"ptr_info{i}.dev_ptr" if ty[0]=="*" else f"arg{i}" for i, ty in signature_without_constexprs.items())) if len(signature_without_constexprs) > 0 else ''});
+  }}
+
+  if(launch_exit_hook != Py_None){{
+    PyObject* args = Py_BuildValue("(O)", launch_metadata);
+    PyObject* ret = PyObject_CallObject(launch_exit_hook, args);
+    Py_DECREF(args);
+    if (!ret)
+      return NULL;
+  }}
+
+  if (PyErr_Occurred()) {{
+    return NULL;
+  }}
+
+  Py_INCREF(Py_None);
+  return Py_None;
+}}
+
+// 2-D tail guard: main / m_tail / n_tail / corner
+static PyObject* launch_quad(PyObject* self, PyObject* args) {{
+  int gridX, gridY, gridZ;
+  int m_n_arg_idx, m_block_arg_idx, n_n_arg_idx, n_block_arg_idx;
+  PyObject *launch_enter_hook = NULL;
+  PyObject *launch_exit_hook = NULL;
+  PyObject *main_kernel_metadata = NULL;
+  PyObject *m_tail_kernel_metadata = NULL;
+  PyObject *n_tail_kernel_metadata = NULL;
+  PyObject *corner_kernel_metadata = NULL;
+  PyObject *launch_metadata = NULL;
+  PyObject *py_obj_stream;
+  void* pMainKrnl;
+  void* pMTailKrnl;
+  void* pNTailKrnl;
+  void* pCornerKrnl;
+
+  {' '.join([f"{_extracted_type(ty)} arg{i}; " for i, ty in signature.items()])}
+  if(!PyArg_ParseTuple(args, \"iiiOKOKOKOKOOOOiiii{args_format}\", &gridX, &gridY, &gridZ,
+                                       &py_obj_stream,
+                                       &pMainKrnl, &main_kernel_metadata,
+                                       &pMTailKrnl, &m_tail_kernel_metadata,
+                                       &pNTailKrnl, &n_tail_kernel_metadata,
+                                       &pCornerKrnl, &corner_kernel_metadata,
+                                       &launch_metadata, &launch_enter_hook, &launch_exit_hook,
+                                       &m_n_arg_idx, &m_block_arg_idx,
+                                       &n_n_arg_idx, &n_block_arg_idx
+                                       {', ' + arg_ptrs_list if len(signature) > 0 else ''})) {{
+    return NULL;
+  }}
+
+  void *pStream = PyLong_AsVoidPtr(py_obj_stream);
+  kernel_ptr_t main_kernel_ptr   = reinterpret_cast<kernel_ptr_t>(pMainKrnl);
+  kernel_ptr_t m_tail_kernel_ptr = reinterpret_cast<kernel_ptr_t>(pMTailKrnl);
+  kernel_ptr_t n_tail_kernel_ptr = reinterpret_cast<kernel_ptr_t>(pNTailKrnl);
+  kernel_ptr_t corner_kernel_ptr = reinterpret_cast<kernel_ptr_t>(pCornerKrnl);
+
+  int num_threads = 0;
+  PyObject *num_threads_attr = PyObject_GetAttrString(corner_kernel_metadata, "num_cpu_threads");
+  if (num_threads_attr && PyLong_Check(num_threads_attr))
+    num_threads = PyLong_AsLong(num_threads_attr);
+
+  if (launch_enter_hook != Py_None) {{
+    PyObject* hargs = Py_BuildValue("(O)", launch_metadata);
+    PyObject* ret = PyObject_CallObject(launch_enter_hook, hargs);
+    Py_DECREF(hargs);
+    if (!ret) return NULL;
+  }}
+
+  {"; ".join([f"DevicePtrInfo ptr_info{i} = getPointer(arg{i}, {i}); if (!ptr_info{i}.valid) return NULL;" if ty[0] == "*" else "" for i, ty in signature_without_constexprs.items()])};
+
+  auto get_int_arg_q = [&](int idx, int64_t &out) -> bool {{
+    switch (idx) {{
+{''.join([f'''    case {i}: {{
+      {'if (!PyLong_Check(arg' + str(i) + ')) return false; out = PyLong_AsLongLong(arg' + str(i) + '); if (PyErr_Occurred()) { PyErr_Clear(); return false; } return true;' if ty == "constexpr" else ('return false;' if ty[0] == '*' or ty in ("fp16", "bf16", "fp32", "f32", "fp64") else 'out = static_cast<int64_t>(arg' + str(i) + '); return true;')}
+    }}
+''' for i, ty in signature.items()])}    default:
+      return false;
+    }}
+  }};
+
+  bool use_quad = false;
+  int64_t m_val = 0, m_block_val = 0, n_val = 0, n_block_val = 0;
+  uint32_t full_m = 0, full_n = 0;
+  if (get_int_arg_q(m_n_arg_idx, m_val) && get_int_arg_q(m_block_arg_idx, m_block_val) &&
+      get_int_arg_q(n_n_arg_idx, n_val) && get_int_arg_q(n_block_arg_idx, n_block_val) &&
+      m_block_val > 0 && n_block_val > 0 && m_val >= 0 && n_val >= 0) {{
+    int64_t exp_gx = (m_val + m_block_val - 1) / m_block_val;
+    int64_t exp_gy = (n_val + n_block_val - 1) / n_block_val;
+    if (gridX == exp_gx && gridY == exp_gy && gridZ == 1) {{
+      full_m = static_cast<uint32_t>(m_val / m_block_val);
+      full_n = static_cast<uint32_t>(n_val / n_block_val);
+      use_quad = true;
+    }}
+  }}
+
+  if (use_quad) {{
+    int omp_max_threads_q = 1;
+    #ifdef _OPENMP
+    omp_max_threads_q = omp_get_max_threads();
+    #endif
+    int max_threads_q = (num_threads > 0) ? num_threads : omp_max_threads_q;
+    if (max_threads_q == 1) {{
+      for (uint32_t y = 0; y < static_cast<uint32_t>(gridY); ++y) {{
+        for (uint32_t x = 0; x < static_cast<uint32_t>(gridX); ++x) {{
+          bool xt = (x == full_m), yt = (y == full_n);
+          kernel_ptr_t kptr = (!xt && !yt) ? main_kernel_ptr
+                            : ( xt && !yt) ? m_tail_kernel_ptr
+                            : (!xt &&  yt) ? n_tail_kernel_ptr
+                            :                corner_kernel_ptr;
+          (*kptr)({(', '.join(f"ptr_info{i}.dev_ptr" if ty[0]=='*' else f"arg{i}" for i, ty in signature_without_constexprs.items()) + ', ') if len(signature_without_constexprs) > 0 else ''}x, y, 0, gridX, gridY, 1);
+        }}
+      }}
+    }} else {{
+      uint32_t total = static_cast<uint32_t>(gridX) * static_cast<uint32_t>(gridY);
+      #ifdef _OPENMP
+      #pragma omp parallel for schedule(static) num_threads(max_threads_q)
+      #endif
+      for (uint32_t i = 0; i < total; ++i) {{
+        uint32_t x = i % static_cast<uint32_t>(gridX);
+        uint32_t y = i / static_cast<uint32_t>(gridX);
+        bool xt = (x == full_m), yt = (y == full_n);
+        kernel_ptr_t kptr = (!xt && !yt) ? main_kernel_ptr
+                          : ( xt && !yt) ? m_tail_kernel_ptr
+                          : (!xt &&  yt) ? n_tail_kernel_ptr
+                          :                corner_kernel_ptr;
+        (*kptr)({(', '.join(f"ptr_info{i}.dev_ptr" if ty[0]=='*' else f"arg{i}" for i, ty in signature_without_constexprs.items()) + ', ') if len(signature_without_constexprs) > 0 else ''}x, y, 0, gridX, gridY, 1);
+      }}
+    }}
+  }} else {{
+    run_omp_kernels(0, gridX, gridY, gridZ, num_threads, corner_kernel_ptr {(', ' + ', '.join(f"ptr_info{i}.dev_ptr" if ty[0]=="*" else f"arg{i}" for i, ty in signature_without_constexprs.items())) if len(signature_without_constexprs) > 0 else ''});
+  }}
+
+  if (launch_exit_hook != Py_None) {{
+    PyObject* hargs = Py_BuildValue("(O)", launch_metadata);
+    PyObject* ret = PyObject_CallObject(launch_exit_hook, hargs);
+    Py_DECREF(hargs);
+    if (!ret) return NULL;
+  }}
+
+  if (PyErr_Occurred()) {{ return NULL; }}
+  Py_INCREF(Py_None);
+  return Py_None;
+}}
+
 static PyMethodDef ModuleMethods[] = {{
   {{"launch", launch, METH_VARARGS, "Entry point for all kernels with this signature"}},
+  {{"launch_offset", launch_offset, METH_VARARGS, "Entry point for kernels with shifted program_id(0)"}},
+  {{"launch_lower_tri_2d", launch_lower_tri_2d, METH_VARARGS, "Entry point for lower-triangle PID-region dispatch"}},
+  {{"launch_diagonal_2d", launch_diagonal_2d, METH_VARARGS, "Entry point for diagonal PID-region dispatch"}},
+  {{"launch_region_2d", launch_region_2d, METH_VARARGS, "Generic 2D pid-region dispatch (op-code selects tile set)"}},
+  {{"launch_dual", launch_dual, METH_VARARGS, "Entry point for CPU tail-guard dual-kernel dispatch"}},
+  {{"launch_quad", launch_quad, METH_VARARGS, "Entry point for CPU 2D tail-guard quad-kernel dispatch"}},
   {{NULL, NULL, 0, NULL}} // sentinel
 }};
 
@@ -392,6 +992,12 @@ class CPULauncher(object):
         src = make_launcher(constants, signature, ids)
         mod = compile_module_from_src(src, "__triton_cpu_launcher")
         self.launch = mod.launch
+        self.launch_offset = mod.launch_offset
+        self.launch_lower_tri_2d = mod.launch_lower_tri_2d
+        self.launch_diagonal_2d = mod.launch_diagonal_2d
+        self.launch_region_2d = mod.launch_region_2d
+        self.launch_dual = mod.launch_dual
+        self.launch_quad = mod.launch_quad
 
     def __call__(self, *args, **kwargs):
         self.launch(*args, **kwargs)
