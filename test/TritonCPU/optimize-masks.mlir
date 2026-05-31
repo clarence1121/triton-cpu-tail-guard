@@ -95,37 +95,36 @@ module {
 // -----
 
 // No tt.divisibility on size arg, so the existing analysis cannot prove the
-// mask is all-ones. Loop peeling splits this into a main loop and an
-// epilogue loop and marks the main loop with bounds_aligned_to_step.
-// Mask removal on the main loop requires the affine-expression analyzer to
-// see through the affine.apply that computes the peeled upper bound; that
-// extension is a separate step.
+// mask is all-ones. Loop peeling splits this into a main loop (mask
+// optimized away) and an epilogue loop (mask kept). Loop uses i32, which
+// is what Triton emits for kernel-level for-loops.
 
 // CHECK-LABEL: @peel_loop_unknown_size
-// CHECK:       affine.apply
+// CHECK:       arith.remsi
+// CHECK:       arith.subi
 // CHECK:       scf.for
-// CHECK:       {triton_cpu.bounds_aligned_to_step, triton_cpu.peeled}
+// CHECK:       vector.load
+// CHECK:       vector.store
 // CHECK:       scf.for
-// CHECK-NOT:   bounds_aligned_to_step
-// CHECK:       {triton_cpu.peeled}
+// CHECK:       vector.maskedload
+// CHECK:       vector.maskedstore
 
 module {
   tt.func public @peel_loop_unknown_size(%arg0: !tt.ptr<f32>, %arg1: !tt.ptr<f32>, %arg2: i32) {
     %c0 = arith.constant 0 : index
-    %c16 = arith.constant 16 : index
-    %cst = arith.constant dense<[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]> : vector<16xindex>
+    %c0_i32 = arith.constant 0 : i32
+    %c16_i32 = arith.constant 16 : i32
+    %cst = arith.constant dense<[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]> : vector<16xi32>
     %cst_0 = arith.constant dense<0.000000e+00> : vector<16xf32>
-    %n = arith.index_cast %arg2 : i32 to index
-    %2 = vector.broadcast %n : index to vector<16xindex>
-    scf.for %iv = %c0 to %n step %c16 {
-      %4 = vector.broadcast %iv : index to vector<16xindex>
-      %5 = arith.addi %4, %cst : vector<16xindex>
-      %6 = arith.cmpi slt, %5, %2 : vector<16xindex>
-      %iv_i32 = arith.index_cast %iv : index to i32
-      %7 = tt.addptr %arg0, %iv_i32 : !tt.ptr<f32>, i32
+    %2 = vector.broadcast %arg2 : i32 to vector<16xi32>
+    scf.for %iv = %c0_i32 to %arg2 step %c16_i32 : i32 {
+      %4 = vector.broadcast %iv : i32 to vector<16xi32>
+      %5 = arith.addi %4, %cst : vector<16xi32>
+      %6 = arith.cmpi slt, %5, %2 : vector<16xi32>
+      %7 = tt.addptr %arg0, %iv : !tt.ptr<f32>, i32
       %8 = triton_cpu.ptr_to_memref %7 : <f32> -> memref<16xf32>
       %9 = vector.maskedload %8[%c0], %6, %cst_0 : memref<16xf32>, vector<16xi1>, vector<16xf32> into vector<16xf32>
-      %10 = tt.addptr %arg1, %iv_i32 : !tt.ptr<f32>, i32
+      %10 = tt.addptr %arg1, %iv : !tt.ptr<f32>, i32
       %11 = triton_cpu.ptr_to_memref %10 : <f32> -> memref<16xf32>
       vector.maskedstore %11[%c0], %6, %9 : memref<16xf32>, vector<16xi1>, vector<16xf32>
     }

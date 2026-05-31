@@ -253,6 +253,16 @@ AffineExpr buildMinOrMaxExpr(Value val, bool isSigned, bool isMax,
   } else if (auto def = val.getDefiningOp<arith::SubIOp>()) {
     return buildMinOrMaxExpr(def.getLhs(), isSigned, isMax, symbolTable) -
            buildMinOrMaxExpr(def.getRhs(), isSigned, !isMax, symbolTable);
+  } else if (auto def = val.getDefiningOp<arith::RemSIOp>()) {
+    // remsi(x, d) lies in [-|d|+1, |d|-1] in general. For loop trip-count
+    // arithmetic we only need the lower bound: assuming the dividend is
+    // non-negative (true for every Triton-emitted bound expression), the
+    // result is >= 0. For max we fall through to the opaque-symbol path
+    // below, which is conservative but harmless: this handler is only
+    // load-bearing in the peeled main-upper formula `upper - (range mod
+    // step)`, where the subi case already does max(upper) - min(rem).
+    if (!isMax)
+      return getAffineConstantExpr(0, val.getContext());
   } else if (auto blockArg = dyn_cast<BlockArgument>(val)) {
     auto op = blockArg.getOwner()->getParentOp();
     if (auto forOp = dyn_cast<scf::ForOp>(op)) {
@@ -358,25 +368,66 @@ constexpr llvm::StringLiteral kBoundsAlignedAttr =
 // bloat code for huge loops where the win is small.
 constexpr int kMaxPeelBodyOps = 50;
 
+// Build the peeled main loop's upper bound using plain arith ops, working
+// for both index- and integer-typed loops. Result is
+//   upper - (upper - lower) mod step
+// which equals lower + step * floor((upper - lower) / step), the largest
+// value <= upper with (result - lower) divisible by step.
+Value buildPeeledUpper(scf::ForOp forOp, PatternRewriter &rewriter) {
+  Location loc = forOp.getLoc();
+  Value lower = forOp.getLowerBound();
+  Value upper = forOp.getUpperBound();
+  Value step = forOp.getStep();
+  rewriter.setInsertionPoint(forOp);
+  Value range = arith::SubIOp::create(rewriter, loc, upper, lower);
+  Value rem = arith::RemSIOp::create(rewriter, loc, range, step);
+  return arith::SubIOp::create(rewriter, loc, upper, rem);
+}
+
+// Clone forOp's body into a new scf.for that runs from `lower` to forOp's
+// original upper bound with the same step. iter_args of the new loop are
+// seeded from `initArgs` (typically the main loop's results).
+scf::ForOp cloneForWithNewBounds(scf::ForOp forOp, Value lower, Value upper,
+                                 ValueRange initArgs,
+                                 PatternRewriter &rewriter) {
+  Location loc = forOp.getLoc();
+  Value step = forOp.getStep();
+  auto newFor = scf::ForOp::create(
+      rewriter, loc, lower, upper, step, initArgs,
+      [&](OpBuilder &builder, Location nestedLoc, Value newIv,
+          ValueRange newIters) {
+        IRMapping mapping;
+        mapping.map(forOp.getInductionVar(), newIv);
+        for (auto [oldArg, newArg] :
+             llvm::zip(forOp.getRegionIterArgs(), newIters))
+          mapping.map(oldArg, newArg);
+        for (Operation &op : forOp.getBody()->without_terminator())
+          builder.clone(op, mapping);
+        auto oldYield = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
+        SmallVector<Value> yieldVals;
+        for (Value v : oldYield.getResults())
+          yieldVals.push_back(mapping.lookupOrDefault(v));
+        scf::YieldOp::create(builder, nestedLoc, yieldVals);
+      });
+  return newFor;
+}
+
 // When a for-loop still carries an unproven mask after OptimizeMask has
 // run, split it into a main loop whose trip count is a multiple of the
 // step and an epilogue loop for the remainder. The main loop's bounds
 // then satisfy the structural invariant `iv + step <= upper`, which lets
 // OptimizeMask prove the mask all-ones on a second pass.
+//
+// We peel manually using arith ops (rather than MLIR's
+// peelForLoopAndSimplifyBounds) so that integer-typed loops are also
+// supported -- Triton emits i32 loops, and the upstream utility emits
+// affine.apply which only accepts index operands.
 struct PeelForLoopWithMask : public OpRewritePattern<scf::ForOp> {
   using OpRewritePattern::OpRewritePattern;
 
   LogicalResult matchAndRewrite(scf::ForOp forOp,
                                 PatternRewriter &rewriter) const override {
     if (forOp->hasAttr(kPeeledAttr))
-      return failure();
-
-    // TODO: extend to non-index induction variables. MLIR's
-    // peelForLoopAndSimplifyBounds emits affine.apply for the new bounds,
-    // which only accepts index operands. Triton-emitted loops typically
-    // use i32, so this gate currently rejects the common case; supporting
-    // it requires manual arith-based peeling.
-    if (!forOp.getInductionVar().getType().isIndex())
       return failure();
 
     bool hasMaskedAccess = false;
@@ -395,14 +446,41 @@ struct PeelForLoopWithMask : public OpRewritePattern<scf::ForOp> {
     if (opCount > kMaxPeelBodyOps)
       return failure();
 
-    scf::ForOp partial;
-    if (failed(scf::peelForLoopAndSimplifyBounds(rewriter, forOp, partial)))
-      return failure();
+    // Peeling only pays off when the step is non-trivial and the bounds
+    // aren't already known to divide evenly. Bail on step == 1 (no SIMD
+    // alignment story to chase) and on constant bounds whose remainder
+    // is statically zero.
+    if (auto stepCst = forOp.getStep().getDefiningOp<arith::ConstantOp>()) {
+      auto stepInt = dyn_cast<IntegerAttr>(stepCst.getValue());
+      if (stepInt && stepInt.getInt() <= 1)
+        return failure();
+    }
+
+    Value originalUpper = forOp.getUpperBound();
+    Value mainUpper = buildPeeledUpper(forOp, rewriter);
+
+    // Build the partial-iteration loop running from mainUpper to the
+    // original upper, seeded by the main loop's results. Insert it
+    // after the (about-to-be-shrunk) main loop.
+    rewriter.setInsertionPointAfter(forOp);
+    scf::ForOp partial = cloneForWithNewBounds(
+        forOp, mainUpper, originalUpper, forOp.getResults(), rewriter);
+
+    // Reroute users of the original loop's results to the partial loop's
+    // results. The partial loop itself consumes them as init args, so use
+    // replaceAllUsesExcept to skip its operands.
+    for (auto [oldRes, newRes] :
+         llvm::zip(forOp.getResults(), partial.getResults()))
+      rewriter.replaceAllUsesExcept(oldRes, newRes, partial);
+
+    // Shrink the original loop to be the main loop.
+    rewriter.startOpModification(forOp);
+    forOp.setUpperBound(mainUpper);
+    rewriter.finalizeOpModification(forOp);
 
     forOp->setAttr(kPeeledAttr, rewriter.getUnitAttr());
     forOp->setAttr(kBoundsAlignedAttr, rewriter.getUnitAttr());
-    if (partial)
-      partial->setAttr(kPeeledAttr, rewriter.getUnitAttr());
+    partial->setAttr(kPeeledAttr, rewriter.getUnitAttr());
     return success();
   }
 };
