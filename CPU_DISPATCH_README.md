@@ -178,6 +178,12 @@ a real runtime K mask preserved in its IR.  This is what 2-D Tail Guard does.
 
 ## 3. Architecture
 
+> Want the line-by-line walkthrough? See [`TAIL_GUARD_INTERNALS.md`](TAIL_GUARD_INTERNALS.md)
+> for the full implementation deep-dive: AST recognition, mask
+> simplifier, JIT integration, C launcher dispatch, OpenMP scheduling,
+> and timing methodology — every step with `file:line` citations and
+> concrete code excerpts. This section is the executive summary.
+
 ### 3.1 Compile-time path
 
 ```
