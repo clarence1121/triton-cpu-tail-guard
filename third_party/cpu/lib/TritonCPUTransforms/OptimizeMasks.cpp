@@ -1,6 +1,7 @@
 #include "cpu/include/TritonCPUTransforms/OptCommon.h"
 #include "cpu/include/TritonCPUTransforms/Passes.h"
 
+#include "mlir/Dialect/SCF/Transforms/Transforms.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
@@ -266,8 +267,13 @@ AffineExpr buildMinOrMaxExpr(Value val, bool isSigned, bool isMax,
                                    symbolTable);
 
         // For max value we use upper bound - 1 in generic case and bound - step
-        // if both bounds are divisible by the step.
-        if (isAlwaysDivisible(lower, step) && isAlwaysDivisible(upper, step)) {
+        // if (upper - lower) is divisible by step. The latter holds when both
+        // bounds are individually divisible by step, or when the loop carries
+        // the triton_cpu.bounds_aligned_to_step marker (set by loop peeling).
+        bool boundsAlignedToStep =
+            (isAlwaysDivisible(lower, step) && isAlwaysDivisible(upper, step)) ||
+            forOp->hasAttr("triton_cpu.bounds_aligned_to_step");
+        if (boundsAlignedToStep) {
           return buildMinOrMaxExpr(upper, isSigned, isMax, symbolTable) -
                  buildMinOrMaxExpr(step, isSigned, false, symbolTable);
         }
@@ -337,6 +343,70 @@ struct OptimizeMask : public OpRewritePattern<arith::CmpIOp> {
   }
 };
 
+// Marker attribute used to prevent re-peeling the loops produced by
+// PeelForLoopWithMask (both the main loop and the partial iteration loop).
+constexpr llvm::StringLiteral kPeeledAttr = "triton_cpu.peeled";
+
+// Set on the main loop produced by peeling. Signals that
+// (upper - lower) % step == 0 structurally, even when neither bound is
+// individually divisible by step. Read by buildMinOrMaxExpr to tighten
+// the max-of-induction-variable estimate from `upper - 1` to `upper - step`.
+constexpr llvm::StringLiteral kBoundsAlignedAttr =
+    "triton_cpu.bounds_aligned_to_step";
+
+// Cap on body size; peeling clones the loop body, so we don't want to
+// bloat code for huge loops where the win is small.
+constexpr int kMaxPeelBodyOps = 50;
+
+// When a for-loop still carries an unproven mask after OptimizeMask has
+// run, split it into a main loop whose trip count is a multiple of the
+// step and an epilogue loop for the remainder. The main loop's bounds
+// then satisfy the structural invariant `iv + step <= upper`, which lets
+// OptimizeMask prove the mask all-ones on a second pass.
+struct PeelForLoopWithMask : public OpRewritePattern<scf::ForOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(scf::ForOp forOp,
+                                PatternRewriter &rewriter) const override {
+    if (forOp->hasAttr(kPeeledAttr))
+      return failure();
+
+    // TODO: extend to non-index induction variables. MLIR's
+    // peelForLoopAndSimplifyBounds emits affine.apply for the new bounds,
+    // which only accepts index operands. Triton-emitted loops typically
+    // use i32, so this gate currently rejects the common case; supporting
+    // it requires manual arith-based peeling.
+    if (!forOp.getInductionVar().getType().isIndex())
+      return failure();
+
+    bool hasMaskedAccess = false;
+    bool anyUnprovenMask = false;
+    int opCount = 0;
+    for (Operation &op : forOp.getBody()->without_terminator()) {
+      ++opCount;
+      if (isa<vector::MaskedLoadOp, vector::MaskedStoreOp>(&op))
+        hasMaskedAccess = true;
+      if (auto cmp = dyn_cast<arith::CmpIOp>(&op))
+        if (!isAlwaysAllOnes(cmp))
+          anyUnprovenMask = true;
+    }
+    if (!hasMaskedAccess || !anyUnprovenMask)
+      return failure();
+    if (opCount > kMaxPeelBodyOps)
+      return failure();
+
+    scf::ForOp partial;
+    if (failed(scf::peelForLoopAndSimplifyBounds(rewriter, forOp, partial)))
+      return failure();
+
+    forOp->setAttr(kPeeledAttr, rewriter.getUnitAttr());
+    forOp->setAttr(kBoundsAlignedAttr, rewriter.getUnitAttr());
+    if (partial)
+      partial->setAttr(kPeeledAttr, rewriter.getUnitAttr());
+    return success();
+  }
+};
+
 struct OptimizeMasks
     : public triton::cpu::impl::OptimizeMasksBase<OptimizeMasks> {
   OptimizeMasks() = default;
@@ -345,18 +415,27 @@ struct OptimizeMasks
     MLIRContext *context = &getContext();
     ModuleOp mod = getOperation();
 
-    // TODO: This pass optimizes out masks applying a set of very strict
-    // patterns. We should use more generic range and divisibility analysis
-    // to cover more cases and remove dependency on other transformations.
-    RewritePatternSet patterns(context);
-    patterns.add<CdivToDiv>(context);
-    patterns.add<ScaleInductionVariable>(context);
-    patterns.add<OptimizeMask>(context);
-    if (failed(mlir::applyPatternsGreedily(mod, std::move(patterns))))
-      return signalPassFailure();
+    // Phase 1: remove masks that the current analysis can already prove
+    // are all-ones (typically driven by tt.divisibility hints).
+    {
+      RewritePatternSet patterns(context);
+      patterns.add<CdivToDiv>(context);
+      patterns.add<ScaleInductionVariable>(context);
+      patterns.add<OptimizeMask>(context);
+      if (failed(mlir::applyPatternsGreedily(mod, std::move(patterns))))
+        return signalPassFailure();
+    }
 
-    // TODO: if masks removal failed for loads/stores in a for-loop, we might
-    // still optimize it using loop peeling.
+    // Phase 2: for loops that still carry unproven masks, peel a partial
+    // iteration out so the main loop's bounds divide the step evenly,
+    // then re-run OptimizeMask on the main loop's now-provable cmpi.
+    {
+      RewritePatternSet patterns(context);
+      patterns.add<PeelForLoopWithMask>(context);
+      patterns.add<OptimizeMask>(context);
+      if (failed(mlir::applyPatternsGreedily(mod, std::move(patterns))))
+        return signalPassFailure();
+    }
   }
 };
 
