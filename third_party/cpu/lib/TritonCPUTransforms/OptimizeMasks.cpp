@@ -9,6 +9,9 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonCPU/IR/Dialect.h"
 
+#include <cstdlib>
+#include <string>
+
 namespace mlir {
 namespace triton {
 namespace cpu {
@@ -507,7 +510,10 @@ struct OptimizeMasks
     // Phase 2: for loops that still carry unproven masks, peel a partial
     // iteration out so the main loop's bounds divide the step evenly,
     // then re-run OptimizeMask on the main loop's now-provable cmpi.
-    {
+    // Gated by TRITON_CPU_LOOP_PEEL (default on); set to 0 to disable
+    // for benchmarking or to bisect regressions.
+    if (const char *env = std::getenv("TRITON_CPU_LOOP_PEEL");
+        !env || std::string(env) != "0") {
       RewritePatternSet patterns(context);
       patterns.add<PeelForLoopWithMask>(context);
       patterns.add<OptimizeMask>(context);
