@@ -14,15 +14,21 @@ the per-iteration mask all-ones, so without peel every iteration pays
 the cmpi + vmaskmovps cost. With peel, ~N/BLOCK iterations run as plain
 vector.load.
 
+Timing uses triton.testing.do_bench(measure_time_with_hooks=True). The
+default `kernel[grid](...)` call path includes a Python-side launcher
+(signature serialize / constexpr resolve / arg pack) whose overhead is
+in the same order of magnitude as a fast kernel and dilutes the
+kernel-level speedup -- and at large N, the launcher overhead variance
+can flip the sign of the comparison. The CPU-only entry/exit hooks
+bracket the actual kernel execution, isolating the IR change.
+
 We use N values that are NOT multiples of BLOCK so that Triton's JIT
 does not auto-infer tt.divisibility on N.
 """
 import os
 import shutil
-import statistics
 import subprocess
 import sys
-import time
 
 import torch
 import triton
@@ -42,19 +48,23 @@ def sum_kernel(X, OUT, N, BLOCK: tl.constexpr):
     tl.store(OUT, acc)
 
 
-def time_kernel(N: int, block: int, iters: int = 200, warmup: int = 20) -> float:
-    """Returns median seconds-per-call."""
+def time_kernel(N: int, block: int) -> float:
+    """Returns median seconds-per-call, kernel-only (no Python wrapper)."""
     x = torch.randn(N, dtype=torch.float32)
     out = torch.zeros(1, dtype=torch.float32)
-    grid = (1,)
-    for _ in range(warmup):
-        sum_kernel[grid](x, out, N, BLOCK=block)
-    samples = []
-    for _ in range(iters):
-        t0 = time.perf_counter()
-        sum_kernel[grid](x, out, N, BLOCK=block)
-        samples.append(time.perf_counter() - t0)
-    return statistics.median(samples)
+
+    def call():
+        sum_kernel[(1,)](x, out, N, BLOCK=block)
+
+    call()  # warmup compile
+    # return_mode="min" is more stable than median for hot-path measurements:
+    # the cold/throttled iterations get filtered out automatically.
+    ms = triton.testing.do_bench(
+        call, warmup=100, rep=500,
+        measure_time_with_hooks=True,
+        return_mode="min",
+    )
+    return ms * 1e-3  # ms → s
 
 
 def child_run(setting: str, sizes, block: int):
