@@ -54,15 +54,16 @@ time from runtime `N`. The main loop runs `N / BLOCK` iterations with
 remainder of at most one iteration.
 
 Measured on a sum-reduction kernel with peel-disabled vs peel-enabled
-A/B (kernel-only timing, no Python wrapper):
+A/B (kernel-only timing, no Python wrapper; single-core-pinned on a
+dedicated 32-core box):
 
 ```
        N    disabled (µs)    enabled (µs)   speedup
    --------------------------------------------------------
-       10007            ~8              ~7     1.17x
-       65537           ~31             ~24     1.31x    ← L2-resident
-      262147           ~85             ~84     1.06x
-     1048573          ~330            ~310     1.02x    ← memory-bound, mask cost hidden
+       10007            ~6              ~5     1.24x
+       65537           ~25             ~17     1.44x
+      262147           ~70             ~40     1.75x
+     1048573          ~208            ~98     2.12x    ← best; speedup grows with N
 ```
 
 Pass is **default-on**; set `TRITON_CPU_LOOP_PEEL=0` to disable.
@@ -1035,42 +1036,52 @@ Sum-reduction kernel above, `N` set to prime values (so Triton's JIT
 doesn't auto-infer `tt.divisibility` and Phase 1 leaves the mask in
 place — making Phase 2 the load-bearing optimization).
 
-Median of three runs of `_bench_loop_peel.py` (hook-based timing,
-`return_mode="min"`):
+Re-measured 2026-06-01 on a dedicated 32-core Linux box (no competing
+load), `_bench_loop_peel.py` with hook-based timing,
+`return_mode="min"`. The benchmark is sensitive to CPU
+frequency/scheduler noise when run unpinned — the `enabled` column
+swung 3–4× run-to-run (e.g. N=1048573 read 180 / 101 / 394 µs across
+three back-to-back runs). Pinning the process to a single core
+(`taskset -c 3`) makes it stable and reproducible; the `disabled`
+column was already stable either way. Numbers below are the average of
+two single-core-pinned runs:
 
 ```
        N    disabled (µs)    enabled (µs)   speedup
    --------------------------------------------------------
-       10007            ~8              ~7     1.17x
-       65537           ~31             ~24     1.31x   ← best
-      262147           ~85             ~84     1.06x
-     1048573          ~330            ~310     1.02x
+       10007            ~6              ~5     1.24x
+       65537           ~25             ~17     1.44x
+      262147           ~70             ~40     1.75x
+     1048573          ~208            ~98     2.12x   ← best
 ```
 
 Pattern reading:
 
 | N range | Working-set fit | Bottleneck | Speedup |
 |---|---|---|---|
-| 10K | L1 | mixed compute/load | 1.17x |
-| 64K | L2 | **compute-bound** | **1.31x** |
-| 256K | L3 | bandwidth | 1.06x |
-| 1M+ | RAM | **memory-bandwidth-bound** | 1.02x (~neutral) |
+| 10K | L1 | mixed compute/load | 1.24x |
+| 64K | L2 | compute-bound | 1.44x |
+| 256K | L3 | bandwidth | 1.75x |
+| 1M+ | RAM | memory-bandwidth-bound | **2.12x** |
 
-The speedup is largest where the kernel is compute-bound (L2-resident,
-inner loop is short enough that the saved SIMD ops actually move the
-needle). Once memory bandwidth becomes the bottleneck (L3 to RAM),
-the mask-op savings hide behind load latency and the speedup
-collapses toward 1.0x.
+On this machine the speedup **grows** with N rather than collapsing
+toward 1.0x. This is the opposite of the trend recorded on the
+original development box, where the win peaked at L2 and washed out to
+~1.02x once the kernel became memory-bandwidth-bound. The likely cause
+is memory-level parallelism: the peeled main loop emits plain
+`vector.load`, which LLVM is free to unroll, software-pipeline, and
+issue speculatively — keeping many more loads in flight than the
+`vector.maskedload` path, which cannot be speculated past the mask. On
+a chip whose load ports and prefetchers can absorb that extra
+parallelism, the unmasked loop stays ~2× ahead even at RAM-resident
+sizes instead of saturating at the same bandwidth as the masked
+version.
 
-This is the opposite of what intuition might suggest (larger N → more
-iterations → more savings). The reason is exactly what physical CPU
-performance models predict: per-iteration ALU savings only matter when
-ALU is the bottleneck.
-
-The earlier `1.26x at N=262147` claim from before the hook-timing fix
-was an artifact of Python wrapper noise variance, not real
-performance. The corrected numbers above are what the kernel actually
-does.
+So the headline is unchanged — peel is a win across every size tested
+— but the *shape* of the win is machine-dependent: compute-bound
+mask-op savings at small N, load-speculation/MLP savings at large N.
+The earlier "collapses toward 1.0x at large N" reading held for the
+original box and does **not** hold on this hardware.
 
 ---
 
