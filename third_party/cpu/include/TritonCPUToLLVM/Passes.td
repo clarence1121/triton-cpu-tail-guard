@@ -28,6 +28,26 @@ def MemoryOpToLLVM : Pass<"triton-cpu-memory-op-to-llvm", "mlir::ModuleOp"> {
                              "mlir::triton::cpu::TritonCPUDialect"];
 }
 
+def NonTemporalStore : Pass<"triton-cpu-non-temporal-store", "mlir::ModuleOp"> {
+    let summary = "Mark write-only stores nontemporal for cache bypass.";
+    let description = [{
+        Walks LLVM stores and sets the `nontemporal` attribute on stores
+        whose address comes from a function argument the kernel never reads
+        (write-only output buffers). Triggers the x86 movnt-family
+        instructions (`vmovntps`, `vmovntdq`, ...) in the LLVM backend, which
+        bypass L1/L2 cache and free that bandwidth for the kernel's hot
+        re-read data.
+
+        Off by default; enable with `TRITON_CPU_NT_STORE=1`. Off by default
+        because Triton-CPU is often used in chained workloads where the next
+        kernel re-reads the previous output -- non-temporal stores would
+        LOSE in that pattern by evicting useful data from cache.
+    }];
+    let constructor = "mlir::triton::cpu::createNonTemporalStorePass()";
+
+    let dependentDialects = ["mlir::LLVM::LLVMDialect"];
+}
+
 def GetProgramIdOpToLLVM : Pass<"triton-cpu-get-program-id-op-to-llvm", "mlir::ModuleOp"> {
     let summary = "Convert Triton GetProgramId to LLVM for CPU.";
     let description = [{}];

@@ -162,6 +162,9 @@ void init_triton_cpu_passes_ttcpuir(py::module &&m) {
   m.def("add_memory_op_to_llvmir", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::cpu::createMemoryOpToLLVMPass());
   });
+  m.def("add_non_temporal_store", [](mlir::PassManager &pm) {
+    pm.addPass(mlir::triton::cpu::createNonTemporalStorePass());
+  });
   m.def("add_atomic_ops_to_llvmir", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::cpu::createAtomicOpsToLLVMPass());
   });

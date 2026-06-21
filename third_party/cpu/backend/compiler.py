@@ -277,6 +277,9 @@ class CPUBackend(BaseBackend):
         passes.convert.add_math_to_llvmir(pm)
         cpu.passes.ttcpuir.add_math_to_libm(pm)
         cpu.passes.ttcpuir.add_vector_to_llvmir(pm, options.enable_fast_math)
+        # Marks write-only stores nontemporal when TRITON_CPU_NT_STORE=1.
+        # Pass itself is a no-op when the env var is unset; runs cheaply.
+        cpu.passes.ttcpuir.add_non_temporal_store(pm)
         cpu.passes.ttcpuir.add_memref_to_llvmir(pm)
         passes.convert.add_reconcile_unrealized(pm)
         passes.convert.add_arith_to_llvmir(pm)
