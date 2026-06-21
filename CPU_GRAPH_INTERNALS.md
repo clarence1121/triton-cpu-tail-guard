@@ -131,36 +131,83 @@ For **realistic kernels** (those doing 50–500µs of actual work), the
 wrapper share drops dramatically and the achievable speedup shrinks
 toward the 1.05–1.2× range — same shape as GPU's curve, just shifted.
 
-## 5. Scope limits of this PoC
+## 5. Extending the PoC
 
-What this PoC deliberately **doesn't** handle, that a production
-implementation would need:
+The original PoC was single-thread, grid=(1,), same args. Three
+extensions were validated:
 
-1. **OMP-parallel kernels (grid > 1, multi-thread)**: first attempt
-   segfaulted, likely due to thread-init / TLS interaction between
-   the trampoline's OMP context and Triton's kernel. Needs the
-   trampoline to inline the same OMP loop logic the existing
-   launcher uses (see `run_omp_kernels` in
-   `python/triton/backends/cpu/driver.py:272`).
-2. **Different kernels in the chain** (not just same kernel N times):
-   trampoline must take an array of (fn_ptr, args_blob) and
-   dispatch in order.
-3. **Different args per call** (e.g. ping-pong output buffers):
-   trampoline must accept arg arrays per call position, or buffer
-   addresses must be threaded through.
-4. **Capture API**: a clean `with cpu_graph.capture(): ...` context
-   that records launches automatically (vs. the manual setup in the
-   PoC script). Mirror of `torch.cuda.graph()`.
-5. **Constexpr handling**: the PoC's kernel takes BLOCK as constexpr,
-   which is baked in at compile time. Different constexpr values
-   would need different compiled trampolines.
-6. **Tail-guard interaction**: PoC sets `TRITON_CPU_TAIL_GUARD=0`
-   because tail-guard wraps the compiled object in
-   `DualPathCompiledKernel` / `QuadPathCompiledKernel`, which don't
-   expose `compiled.function` directly. Production would need to
-   either disable tail-guard for graphed kernels or extract the
-   main/m_tail/n_tail/corner function pointers and call the right
-   one per tile (mirroring `launch_quad`'s dispatch in C).
+### 5.1 OMP-parallel kernels (`_bench_cpu_graph_omp.py`)
+
+The earlier-reported segfault was a red herring — the actual cause
+was tail-guard wrapping `compiled` in `DualPathCompiledKernel`, which
+returns `compiled.function = None`. Fix: extract
+`compiled.main_kernel.function`. OMP itself works fine.
+
+Trampoline with `#pragma omp parallel for` across grid programs,
+OMP_NUM_THREADS=8:
+
+```
+N=4,096    grid=   4   chain=  1→64   eager 14.2→674.2 us   graph  1.8→64.8 us   7.9×→10.4×
+N=65,536   grid=  64   chain=  1→64   eager 25.2→950.2 us   graph  6.2→167.0 us  4.1×→ 5.7×
+N=1,048,576 grid=1024  chain=  1→64   eager 36.7→3810.5 us  graph 36.4→1854.3 us 1.0×→ 2.1×
+```
+
+Pattern confirms the theoretical model: as kernel work share grows
+relative to Python-wrapper share, speedup contracts toward 1×. At
+N=1M the per-kernel work is large enough that wrapper overhead is
+trivial — graph wins by ~2× at chain=64 (more launches amortized)
+and only 1.01× at chain=1.
+
+### 5.2 Different args per call (`_bench_cpu_graph_pingpong.py`)
+
+Realistic chain shape: each call writes to a fresh output buffer
+that becomes the next call's input. Trampoline takes arrays of
+`(x_ptr, y_ptr, out_ptr)` per position. Single-thread, tiny axpy:
+
+```
+ chain   eager (us)   graph (us)   speedup
+     1        35.73         1.03    34.64x
+     4        88.30         2.26    39.10x
+    16       316.68         4.61    68.76x
+    64      1298.75        12.13   107.07x
+   256      5764.54        40.79   141.32x
+```
+
+Slightly lower than same-args case (141× vs 189× at chain=256)
+because per-iter eager pays additional Python work for setting up
+different args. Correctness: 4.77e-7 (~1 ULP of f32 — exact within
+order-of-summation precision).
+
+### 5.3 Tail-guard interaction
+
+`DualPathCompiledKernel.function` is None; use `.main_kernel.function`.
+Future production version would need to mirror `launch_quad`'s
+per-pid dispatch logic in the trampoline to handle the 4-binary
+case. For now, all the PoC benches set `TRITON_CPU_TAIL_GUARD=0` to
+get a plain `CompiledKernel` with a directly-usable `.function`.
+
+## 6. What's still scope-limited
+
+What a true production version would need beyond the current PoC:
+
+1. **Capture API**: a clean `with cpu_graph.capture(): ...` context
+   that records launches automatically by hooking
+   `__triton_cpu_launcher`, instead of the manual setup in the PoC
+   scripts. Mirror of `torch.cuda.graph()`.
+2. **Different kernels in the chain**: trampoline currently calls
+   one fixed kernel N times. Real LLM/RNN pipelines mix kernels —
+   would need an array of `(fn_ptr, args_blob)` tuples and dispatch
+   per position.
+3. **Tail-guard handling in the trampoline**: extract all 4
+   variants and inline the `launch_quad`-style per-tile decision
+   logic so graphed kernels can keep the tail-guard win.
+4. **Constexpr handling**: PoC kernels have constexpr baked in.
+   Different constexpr values across a chain would need different
+   trampoline compilation steps.
+5. **OMP scheduling shared with launcher**: PoC OMP loop is
+   `schedule(static)`. Should match what `run_omp_kernels` chose
+   for the original kernel (could be `dynamic, 1` for unbalanced
+   workloads).
 
 ## 6. Place in the portfolio
 
@@ -183,8 +230,14 @@ via the graph trampoline).
 # Overhead breakdown
 conda run -n triton-cpu python python/test/unit/cpu/_bench_cpu_graph_overhead.py
 
-# PoC bench
+# Single-thread PoC (same kernel, same args)
 conda run -n triton-cpu python python/test/unit/cpu/_bench_cpu_graph_poc.py
+
+# OMP-parallel PoC (grid > 1, multi-thread)
+conda run -n triton-cpu python python/test/unit/cpu/_bench_cpu_graph_omp.py
+
+# Ping-pong PoC (different args per call)
+conda run -n triton-cpu python python/test/unit/cpu/_bench_cpu_graph_pingpong.py
 ```
 
 Both correct against eager output (verified in the script before
