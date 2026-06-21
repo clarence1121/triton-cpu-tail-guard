@@ -66,12 +66,13 @@ LLVM::DITypeAttr LLVMDIUtils::convertPtrType(MLIRContext *context,
 
   unsigned sizeInBits = datalayout.getTypeSizeInBits(pointerType);
   LLVM::DITypeAttr diElTypeAttr = convertType(context, pointeeType);
+  // Bundled LLVM (llvm-20902f0b) has the older DIDerivedTypeAttr::get
+  // signature (10 args, no file/line/scope/flags). Match it.
   LLVM::DITypeAttr diTypeAttr = mlir::LLVM::DIDerivedTypeAttr::get(
       context, llvm::dwarf::DW_TAG_pointer_type,
-      mlir::StringAttr::get(context, "pointer"), /*file=*/nullptr, /*line=*/0,
-      /*scope=*/nullptr, diElTypeAttr, sizeInBits, /*alignInBits=*/0,
-      /*offset=*/0, addrSpace, mlir::LLVM::DIFlags::Zero,
-      /*extra data=*/nullptr);
+      mlir::StringAttr::get(context, "pointer"), diElTypeAttr, sizeInBits,
+      /*alignInBits=*/0, /*offset=*/0, /*dwarfAddressSpace=*/addrSpace,
+      mlir::LLVM::DIFlags::Zero, /*extraData=*/nullptr);
   return diTypeAttr;
 }
 
