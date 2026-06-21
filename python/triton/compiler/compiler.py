@@ -51,12 +51,19 @@ def convert_type_repr(x):
 
 class ASTSource:
 
-    def __init__(self, fn, signature, constexprs=None, attrs=None) -> None:
+    def __init__(self, fn, signature, constexprs=None, attrs=None, cpu_tail_variant=None,
+                 cpu_tail_2d_variant=None,
+                 cpu_region_spec=None, cpu_region_pid_vars=None, cpu_region_all_specs=None) -> None:
         self.fn = fn
         self.language = Language.TRITON
         self.ext = "ttir"
         self.name = fn.__name__
         self.signature = signature
+        self.cpu_tail_variant = cpu_tail_variant
+        self.cpu_tail_2d_variant = cpu_tail_2d_variant
+        self.cpu_region_spec = cpu_region_spec          # RegionSpec | None
+        self.cpu_region_pid_vars = cpu_region_pid_vars  # list[str] | None
+        self.cpu_region_all_specs = cpu_region_all_specs or []  # list[RegionSpec]
         self.constants = dict()
         if constexprs is not None:
             for k, v in constexprs.items():
@@ -67,21 +74,64 @@ class ASTSource:
         for k in self.signature.keys():
             if not isinstance(k, str):
                 raise TypeError("Signature keys must be string")
+        self.cpu_tail_guard_diagnostic = None
+        self.cpu_pid_region_diagnostic = None
 
     def hash(self):
         sorted_sig = [v for k, v in sorted(self.signature.items())]
         get_key = lambda x: x.cache_key if hasattr(x, 'cache_key') else str(x)
         constants_key = '-'.join([get_key(v) for k, v in sorted(self.constants.items())])
-        key = f"{self.fn.cache_key}-{str(self.attrs)}-{sorted_sig}-{constants_key}"
+        cpu_tail_guard_key = os.getenv("TRITON_CPU_TAIL_GUARD", "1")
+        cpu_pid_region_key = os.getenv("TRITON_CPU_PID_REGION", "0")
+        cpu_region_key = self.cpu_region_spec.cache_key() if self.cpu_region_spec is not None else "none"
+        key = (f"{self.fn.cache_key}-{str(self.attrs)}-{sorted_sig}-{constants_key}"
+               f"-{cpu_tail_guard_key}-{self.cpu_tail_variant}-{self.cpu_tail_2d_variant}"
+               f"-{cpu_pid_region_key}-{cpu_region_key}")
         return hashlib.sha256(key.encode("utf-8")).hexdigest()
 
     def make_ir(self, target: GPUTarget, options, codegen_fns, module_map, context):
         from .code_generator import ast_to_ttir
+        self._parsed_tree = None
+        if target.backend == "cpu" and getattr(options, "enable_tail_guard", False):
+            from .cpu_tail import (analyze_cpu_tail, make_cpu_tail_main_variant,
+                                   analyze_cpu_tail_2d, make_cpu_tail_2d_variant)
+            if self.cpu_tail_2d_variant is not None:
+                self._parsed_tree, self.cpu_tail_guard_diagnostic = make_cpu_tail_2d_variant(
+                    self.cpu_tail_2d_variant, self.fn, self)
+            elif self.cpu_tail_variant == "main":
+                self._parsed_tree, self.cpu_tail_guard_diagnostic = make_cpu_tail_main_variant(self.fn, self)
+            else:
+                # Diagnostic only (no rewrite): try 2D first, fall back to 1D
+                a2d = analyze_cpu_tail_2d(self.fn, self)
+                if a2d.diagnostic.matched:
+                    self.cpu_tail_guard_diagnostic = a2d.diagnostic
+                else:
+                    self.cpu_tail_guard_diagnostic = analyze_cpu_tail(self.fn, self).diagnostic
+            debug_tail_guard = os.getenv("TRITON_CPU_TAIL_GUARD_DEBUG", "0") == "1" or getattr(options, "debug", False)
+            if debug_tail_guard and self.cpu_tail_guard_diagnostic is not None:
+                diag = self.cpu_tail_guard_diagnostic
+                status = "matched" if diag.matched else f"rejected: {diag.reason}"
+                variant = f" ({self.cpu_tail_variant})" if self.cpu_tail_variant else ""
+                print(f"triton-cpu tail_guard{variant}: {self.name}: {status}")
+        if target.backend == "cpu" and self.cpu_region_spec is not None:
+            from .cpu_pid_region import make_region_variant
+            self._parsed_tree, _ok = make_region_variant(
+                self.fn, self, self.cpu_region_spec,
+                self.cpu_region_all_specs, self.cpu_region_pid_vars or [])
+            debug_region = (os.getenv("TRITON_CPU_PID_REGION_DEBUG", "0") == "1"
+                            or getattr(options, "debug", False))
+            if debug_region:
+                print(f"triton-cpu pid_region ({self.cpu_region_spec.name}): {self.name}")
         return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
                            module_map=module_map)
 
     def parse_options(self):
         return dict()
+
+    def parse(self):
+        if getattr(self, "_parsed_tree", None) is not None:
+            return self._parsed_tree
+        return self.fn.parse()
 
 
 class IRSource:
@@ -308,6 +358,10 @@ def compile(src, target=None, options=None, _env_vars=None):
     except Exception as e:
         filter_traceback(e)
         raise
+    if isinstance(src, ASTSource) and src.cpu_tail_guard_diagnostic is not None:
+        metadata["cpu_tail_guard"] = src.cpu_tail_guard_diagnostic.asdict()
+    if isinstance(src, ASTSource) and src.cpu_pid_region_diagnostic is not None:
+        metadata["cpu_pid_region"] = src.cpu_pid_region_diagnostic.asdict()
 
     if ir_source:
         ir_filename = f"{file_name}.{src.ext}"
@@ -488,6 +542,28 @@ class CompiledKernel:
             self._init_handles()
         return self._run
 
+    def run_with_offset(self, start_x, grid_0, grid_1, grid_2, stream, launch_metadata, launch_enter_hook,
+                        launch_exit_hook, *args):
+        self._init_handles()
+        self._run.launch_offset(start_x, grid_0, grid_1, grid_2, stream, self.function, self.packed_metadata,
+                                launch_metadata, launch_enter_hook, launch_exit_hook, *args)
+
+    def run_region_2d(self, op, grid_0, grid_1, grid_2, stream, launch_metadata, launch_enter_hook,
+                      launch_exit_hook, *args):
+        self._init_handles()
+        self._run.launch_region_2d(op, grid_0, grid_1, grid_2, stream, self.function, self.packed_metadata,
+                                   launch_metadata, launch_enter_hook, launch_exit_hook, *args)
+
+    def run_lower_tri_2d(self, grid_0, grid_1, grid_2, stream, launch_metadata, launch_enter_hook, launch_exit_hook,
+                         *args):
+        self.run_region_2d(0, grid_0, grid_1, grid_2, stream, launch_metadata, launch_enter_hook,
+                           launch_exit_hook, *args)
+
+    def run_diagonal_2d(self, grid_0, grid_1, grid_2, stream, launch_metadata, launch_enter_hook, launch_exit_hook,
+                        *args):
+        self.run_region_2d(2, grid_0, grid_1, grid_2, stream, launch_metadata, launch_enter_hook,
+                           launch_exit_hook, *args)
+
     def launch_metadata(self, grid, stream, *args):
         if knobs.runtime.launch_enter_hook is None:
             return None
@@ -511,3 +587,148 @@ class CompiledKernel:
                      knobs.runtime.launch_enter_hook, knobs.runtime.launch_exit_hook, *args)
 
         return runner
+
+
+class DualPathCompiledKernel:
+
+    def __init__(self, main_kernel, tail_kernel, diagnostic):
+        self.main_kernel = main_kernel
+        self.tail_kernel = tail_kernel
+        self.metadata = tail_kernel.metadata
+        self.packed_metadata = tail_kernel.packed_metadata
+        self.src = tail_kernel.src
+        self.hash = tail_kernel.hash
+        self.name = tail_kernel.name
+        self.asm = tail_kernel.asm
+        self.main_asm = main_kernel.asm
+        self.metadata_group = tail_kernel.metadata_group
+        self.kernel = tail_kernel.kernel
+        self.module = None
+        self.function = None
+        self._diagnostic = diagnostic
+        if not isinstance(self.src, ASTSource):
+            self._n_arg_idx = -1
+            self._block_arg_idx = -1
+        else:
+            self._n_arg_idx = self.src.fn.arg_names.index(diagnostic.n_name)
+            self._block_arg_idx = self.src.fn.arg_names.index(diagnostic.block_name)
+
+    def run(self, grid_0, grid_1, grid_2, stream, function, packed_metadata, launch_metadata, launch_enter_hook,
+            launch_exit_hook, *args):
+        if self._n_arg_idx < 0 or self._block_arg_idx < 0:
+            return self.tail_kernel.run(grid_0, grid_1, grid_2, stream, self.tail_kernel.function,
+                                        self.tail_kernel.packed_metadata, launch_metadata, launch_enter_hook,
+                                        launch_exit_hook, *args)
+        self.main_kernel._init_handles()
+        self.tail_kernel._init_handles()
+        self.tail_kernel._run.launch_dual(grid_0, grid_1, grid_2, stream, self.main_kernel.function,
+                                          self.main_kernel.packed_metadata, self.tail_kernel.function,
+                                          self.tail_kernel.packed_metadata, launch_metadata, launch_enter_hook,
+                                          launch_exit_hook, self._n_arg_idx, self._block_arg_idx, *args)
+
+    def launch_metadata(self, grid, stream, *args):
+        return self.tail_kernel.launch_metadata(grid, stream, *args)
+
+
+class QuadPathCompiledKernel:
+    """2-D tail guard: main / m_tail / n_tail / corner compiled variants."""
+
+    def __init__(self, main_kernel, m_tail_kernel, n_tail_kernel, corner_kernel, diagnostic):
+        self.main_kernel = main_kernel
+        self.m_tail_kernel = m_tail_kernel
+        self.n_tail_kernel = n_tail_kernel
+        self.corner_kernel = corner_kernel
+        self.metadata = corner_kernel.metadata
+        self.packed_metadata = corner_kernel.packed_metadata
+        self.src = corner_kernel.src
+        self.hash = corner_kernel.hash
+        self.name = corner_kernel.name
+        self.asm = corner_kernel.asm
+        self.metadata_group = corner_kernel.metadata_group
+        self.kernel = corner_kernel.kernel
+        self.module = None
+        self.function = None
+        self._diagnostic = diagnostic
+        if not isinstance(self.src, ASTSource):
+            self._m_n_idx = self._m_block_idx = self._n_n_idx = self._n_block_idx = -1
+        else:
+            names = self.src.fn.arg_names
+            self._m_n_idx = names.index(diagnostic.m_n_name)
+            self._m_block_idx = names.index(diagnostic.m_block_name)
+            self._n_n_idx = names.index(diagnostic.n_n_name)
+            self._n_block_idx = names.index(diagnostic.n_block_name)
+
+    def run(self, grid_0, grid_1, grid_2, stream, function, packed_metadata, launch_metadata,
+            launch_enter_hook, launch_exit_hook, *args):
+        if self._m_n_idx < 0:
+            return self.corner_kernel.run(grid_0, grid_1, grid_2, stream,
+                                          self.corner_kernel.function, self.corner_kernel.packed_metadata,
+                                          launch_metadata, launch_enter_hook, launch_exit_hook, *args)
+        self.main_kernel._init_handles()
+        self.m_tail_kernel._init_handles()
+        self.n_tail_kernel._init_handles()
+        self.corner_kernel._init_handles()
+        self.corner_kernel._run.launch_quad(
+            grid_0, grid_1, grid_2, stream,
+            self.main_kernel.function, self.main_kernel.packed_metadata,
+            self.m_tail_kernel.function, self.m_tail_kernel.packed_metadata,
+            self.n_tail_kernel.function, self.n_tail_kernel.packed_metadata,
+            self.corner_kernel.function, self.corner_kernel.packed_metadata,
+            launch_metadata, launch_enter_hook, launch_exit_hook,
+            self._m_n_idx, self._m_block_idx, self._n_n_idx, self._n_block_idx,
+            *args)
+
+    def launch_metadata(self, grid, stream, *args):
+        return self.corner_kernel.launch_metadata(grid, stream, *args)
+
+
+# Maps RegionSpec.launcher name → (CompiledKernel method, op_code)
+# Op codes for run_omp_region_2d (pidY OP pidX, i.e. pid_axis1 OP pid_axis0):
+#   0=LT(y<x)  1=LE(y<=x)  2=EQ(y==x)  3=GE(y>=x)  4=GT(y>x)  5=NE(y!=x)
+LAUNCHER_METHOD_MAP = {
+    # Canonical names
+    "region_2d_lt": ("run_region_2d", 0),
+    "region_2d_le": ("run_region_2d", 1),
+    "region_2d_eq": ("run_region_2d", 2),
+    "region_2d_ge": ("run_region_2d", 3),
+    "region_2d_gt": ("run_region_2d", 4),
+    "region_2d_ne": ("run_region_2d", 5),
+    # Backward-compat aliases (old names still accepted)
+    "lower_tri_2d": ("run_region_2d", 0),
+    "diagonal_2d":  ("run_region_2d", 2),
+}
+
+
+class RegionCompiledKernel:
+    """Multi-path compiled kernel for generic 2D pid-region dispatch.
+
+    Accepts a list of (CompiledKernel, launcher_name) pairs, one per active
+    region.  At run time each kernel is dispatched via its C-level launcher.
+    """
+
+    def __init__(self, region_kernels: list):
+        # region_kernels: list of (CompiledKernel, launcher_name) ordered by dispatch priority
+        self._region_kernels = region_kernels
+        primary = region_kernels[-1][0]
+        self.metadata = primary.metadata
+        self.packed_metadata = primary.packed_metadata
+        self.src = primary.src
+        self.hash = primary.hash
+        self.name = primary.name
+        self.asm = primary.asm
+        self.metadata_group = primary.metadata_group
+        self.kernel = primary.kernel
+        self.module = None
+        self.function = None
+        # Per-region asm for debugging, keyed by launcher name
+        self.region_asm = {launcher: k.asm for k, launcher in region_kernels}
+
+    def run(self, grid_0, grid_1, grid_2, stream, function, packed_metadata, launch_metadata,
+            launch_enter_hook, launch_exit_hook, *args):
+        for kernel, launcher in self._region_kernels:
+            method_name, op = LAUNCHER_METHOD_MAP[launcher]
+            getattr(kernel, method_name)(op, grid_0, grid_1, grid_2, stream, launch_metadata,
+                                        launch_enter_hook, launch_exit_hook, *args)
+
+    def launch_metadata(self, grid, stream, *args):
+        return self._region_kernels[-1][0].launch_metadata(grid, stream, *args)
